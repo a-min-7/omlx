@@ -40,7 +40,9 @@ __all__ = [
 ]
 
 
-# --- copied from qwen4_exp so this module carries no cross-family import
+# `MoE.combined` must reproduce the host's Metal reduce order bit for bit; the
+# reference lives next to that caller. The dense MLP never reduces expert
+# outputs, so this is not shared behaviour.
 
 def stacked_sum(x: mx.array) -> mx.array:
     """``x.sum(-2)`` over fewer than 32 rows, rounded as on the host.
