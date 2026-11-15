@@ -156,7 +156,7 @@ def _cache_state(i: int, item: Any, since: int) -> Arrays:
 
 
 class Qwen35Adapter(StageAdapter):
-    model_types = ("qwen3_5",)
+    model_types = ("qwen3_5", "qwen3_5_moe")
     contract = 1
     captures_layers = True
 
