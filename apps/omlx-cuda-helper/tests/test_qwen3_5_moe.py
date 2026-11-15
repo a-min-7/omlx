@@ -176,13 +176,19 @@ def test_plan_counts_only_what_a_stage_loads():
     assert not qwen3_5_moe.resident("language_model.mtp.layers.0.mlp.up_proj.weight")
     # A Hugging Face checkpoint needs the host's conversion first.
     with pytest.raises(ValueError, match="MLX layout"):
-        qwen3_5_moe.check_layout({"model.language_model.layers.0.mlp.up_proj.weight": 0})
+        qwen3_5_moe.check_layout(
+            {"model.language_model.layers.0.mlp.up_proj.weight": 0}
+        )
 
 
 def test_plan_leaves_the_3d_expert_banks_packed(monkeypatch):
-    """A bank unpacked as a 2-D linear would inflate the per-layer estimate."""
+    """A bank unpacked as a 2-D linear would inflate the per-layer estimate.
+
+    The recorded fixture is unquantized, so this gives its banks the packed
+    tensors a quantized checkpoint carries: the plan must still skip them on
+    their 3-D shape, not count them as unpacked linears.
+    """
     model = FIXTURE / "model"
-    _, packed = qwen3_5_moe.plan(model)
     index = checkpoint.tensors(model)
     banks = {
         name: tensor
@@ -190,16 +196,28 @@ def test_plan_leaves_the_3d_expert_banks_packed(monkeypatch):
         if name.endswith(".weight")
         and ".switch_mlp." in name
         and len(tensor.shape) == 3
-        and f"{name.removesuffix('.weight')}.scales" in index
     }
     if not banks:
-        pytest.skip("the fixture's expert banks are not quantized")
-    inflated = dict(index)
+        pytest.skip("the fixture has no 3-D expert banks")
+    config = {
+        **checkpoint.load_config(model),
+        "quantization": {"group_size": 64, "bits": 4},
+    }
+    packed = dict(index)
+    for name, tensor in banks.items():
+        for part in ("scales", "biases"):
+            packed[f"{name.removesuffix('.weight')}.{part}"] = replace(
+                tensor, shape=(tensor.shape[0], 1)
+            )
+    monkeypatch.setattr(checkpoint, "load_config", lambda _: config)
+    monkeypatch.setattr(checkpoint, "tensors", lambda _: packed)
+    _, kept = qwen3_5_moe.plan(model)
+    inflated = dict(packed)
     for name, tensor in banks.items():
         inflated[name] = replace(
             tensor, shape=(tensor.shape[0], tensor.shape[1] * tensor.shape[2])
         )
     monkeypatch.setattr(checkpoint, "tensors", lambda _: inflated)
     _, unpacked = qwen3_5_moe.plan(model)
-    assert len(unpacked) == len(packed)
-    assert max(unpacked) > max(packed)
+    assert len(unpacked) == len(kept)
+    assert max(unpacked) > max(kept)
