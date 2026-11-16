@@ -104,19 +104,18 @@ def test_stages_reproduce_the_contract_fixture(bounds):
             assert sorted(got) == sorted(want), tag
             for name, (data, dtype) in got.items():
                 expected, expected_dtype = want[name]
+                message = tag + name
                 assert (dtype, data.dtype, data.shape) == (
                     expected_dtype,
                     expected.dtype,
                     expected.shape,
-                ), (
-                    tag + name
-                )
+                ), message
                 np.testing.assert_allclose(
                     data,
                     expected,
                     rtol=meta["rtol"],
                     atol=meta["atol"],
-                    err_msg=tag + name,
+                    err_msg=message,
                 )
 
 

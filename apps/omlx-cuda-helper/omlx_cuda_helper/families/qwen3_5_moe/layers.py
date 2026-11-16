@@ -19,11 +19,13 @@ from .._qwen35_layers import (
     Attention,
     GatedDeltaNet,
     KVCache,
-    Layer as _Layer,
     Weights,
     causal_conv,
-    rotate,
     rotary_frequencies,
+    rotate,
+)
+from .._qwen35_layers import (
+    Layer as _Layer,
 )
 
 __all__ = [
@@ -41,6 +43,7 @@ __all__ = [
 
 
 # --- copied from qwen4_exp so this module carries no cross-family import
+
 
 def stacked_sum(x: mx.array) -> mx.array:
     """``x.sum(-2)`` over fewer than 32 rows, rounded as on the host.
@@ -196,7 +199,11 @@ class MoE:
         mx.eval(gates, out)
         kernels.logger.info(
             "MoE dtypes: router_weight=%s logits=%s gates=%s output=%s output_dtype_is_bf16=%s",
-            w.dtype, logits.dtype, gates.dtype, out.dtype, str(out.dtype) == "bfloat16",
+            w.dtype,
+            logits.dtype,
+            gates.dtype,
+            out.dtype,
+            str(out.dtype) == "bfloat16",
         )
 
     def _experts_match(self, dtype: mx.Dtype) -> bool:
