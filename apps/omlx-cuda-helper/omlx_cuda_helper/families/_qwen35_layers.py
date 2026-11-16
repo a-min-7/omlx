@@ -316,9 +316,7 @@ class Layer:
     other piece of the layer unchanged.
     """
 
-    def __init__(
-        self, w: Weights, text: dict[str, Any], linear: bool, mlp_block: type
-    ):
+    def __init__(self, w: Weights, text: dict[str, Any], linear: bool, mlp_block: type):
         self.linear = linear
         self.eps = text["rms_norm_eps"]
         self.input_norm = w["input_layernorm.weight"]

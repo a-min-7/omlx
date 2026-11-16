@@ -18,11 +18,13 @@ from .._qwen35_layers import (
     Attention,
     GatedDeltaNet,
     KVCache,
-    Layer as _Layer,
     Weights,
     causal_conv,
-    rotate,
     rotary_frequencies,
+    rotate,
+)
+from .._qwen35_layers import (
+    Layer as _Layer,
 )
 
 __all__ = [

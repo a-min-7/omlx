@@ -14,17 +14,19 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from ... import oqh
 from .. import _qwen35_kernels as kernels
-from .. import oqh
 from .._qwen35_layers import (
     Attention,
     GatedDeltaNet,
     KVCache,
-    Layer as _Layer,
     Weights,
     causal_conv,
-    rotate,
     rotary_frequencies,
+    rotate,
+)
+from .._qwen35_layers import (
+    Layer as _Layer,
 )
 
 __all__ = [
@@ -42,6 +44,7 @@ __all__ = [
 
 
 # --- copied from qwen4_exp so this module carries no cross-family import
+
 
 def stacked_sum(x: mx.array) -> mx.array:
     """``x.sum(-2)`` over fewer than 32 rows, rounded as on the host.
@@ -209,7 +212,11 @@ class MoE:
         mx.eval(gates, out)
         kernels.logger.info(
             "MoE dtypes: router_weight=%s logits=%s gates=%s output=%s output_dtype_is_bf16=%s",
-            w.dtype, logits.dtype, gates.dtype, out.dtype, str(out.dtype) == "bfloat16",
+            w.dtype,
+            logits.dtype,
+            gates.dtype,
+            out.dtype,
+            str(out.dtype) == "bfloat16",
         )
 
     def _experts_match(self, dtype: mx.Dtype) -> bool:
@@ -310,7 +317,9 @@ class MoE:
             # oQh: the activation is taken in float32 and rotated for down.
             rot = self.shared_gate.rotated(x) if rot is None else rot
             act = oqh.act_rotate(
-                self.shared_gate(x, rot), self.shared_up(x, rot), *self.shared_down.rotation
+                self.shared_gate(x, rot),
+                self.shared_up(x, rot),
+                *self.shared_down.rotation,
             )
             shared = self.shared_down(act, act)
         return mx.sigmoid(self.shared_scale(x, rot)) * shared
