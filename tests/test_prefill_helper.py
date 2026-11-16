@@ -48,6 +48,7 @@ from omlx.prefill_helper import routes as helper_routes
 from omlx.prefill_helper import worker as worker_module
 from omlx.prefill_helper.adapter import Capture
 from omlx.prefill_helper.adapters import adapter_for, adapter_for_model
+from omlx.prefill_helper.adapters.qwen3_5 import _language_symbol
 from omlx.prefill_helper.client import HelperClient, HelperError
 from omlx.prefill_helper.launcher import HelperTarget
 from omlx.prefill_helper.manager import PrefillHelperManager
@@ -2009,6 +2010,39 @@ def test_only_a_model_that_gets_a_helper_has_an_adapter(tmp_path):
     assert adapter_for_model("qwen3_5", "vlm", path) is None
     # The other families keep their adapter on every engine.
     assert adapter_for_model("qwen4-exp", "batched", path) is QWEN4
+
+
+def test_mask_builder_resolution_dense():
+    """A dense model takes its mask builders from its own module.
+
+    Weight-free: the adapter only reads the model's class, so the class is
+    asked for the builders without constructing a checkpoint.
+    """
+    from mlx_vlm.models.qwen3_5 import language
+
+    lm = SimpleNamespace(model=language.LanguageModel.__new__(language.LanguageModel))
+    for name in ("_create_qwen3_5_ssm_mask", "_create_qwen3_5_attention_mask"):
+        assert _language_symbol(lm, name) is getattr(language, name)
+
+
+def test_mask_builder_resolution_subclass():
+    """A subclass defined beside it resolves the builders from its base.
+
+    ``qwen3_5_moe``'s language module is ``qwen3_5.language``'s subclass but
+    defines neither builder, so a fixed attribute on the model's own module
+    raises ``AttributeError``. Weight-free, as above.
+    """
+    from mlx_vlm.models.qwen3_5 import language
+    from mlx_vlm.models.qwen3_5_moe import language as moe_language
+
+    lm = SimpleNamespace(
+        model=moe_language.LanguageModel.__new__(moe_language.LanguageModel)
+    )
+    for name in ("_create_qwen3_5_ssm_mask", "_create_qwen3_5_attention_mask"):
+        # The subclass's own module does not define it ...
+        assert not hasattr(moe_language, name)
+        # ... and the base's does.
+        assert _language_symbol(lm, name) is getattr(language, name)
 
 
 def test_qwen35_keeps_a_yarn_prompt_off_the_helpers_attention_layers():
