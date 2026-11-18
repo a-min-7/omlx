@@ -14,7 +14,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from .. import checkpoint, oqh
+from .. import checkpoint
 
 CONTRACT = 1
 FIRST_STAGE_MIN = 1
@@ -82,10 +82,10 @@ def plan(model_dir: str | Path) -> tuple[int, list[int]]:
             # The loader refuses an oQh bank and only ever banks the expert
             # projections, so the estimate asks its question the same way: a
             # signed tensor the loader never banks is skipped like any other.
-            if is_banked(base) and oqh.is_oqh(index, base):
+            if is_banked(base) and checkpoint.is_oqh(index, base):
                 raise ValueError(f"oQh expert banks are not supported: {name}")
             continue
-        signs = index.get(f"{base}.{oqh.SIGNS}")
+        signs = index.get(f"{base}.{checkpoint.OQH_SIGNS}")
         if signs is not None:
             # oQh: dense weight [N, K]; only the signs stay next to it.
             parts = ("rscale", "oqh_scales", "oqh_biases")

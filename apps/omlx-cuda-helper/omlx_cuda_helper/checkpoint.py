@@ -102,6 +102,16 @@ OQH_SIGNS = "oqh_signs"
 OQH_VERSION = 1
 
 
+def is_oqh(weights: dict[str, Any], prefix: str) -> bool:
+    """Whether this tensor dict holds an oQh linear under ``prefix``.
+
+    A header lookup, so it lives here beside the constant and stays importable
+    without a GPU library: the planner refuses oQh expert banks before any
+    worker exists. ``oqh`` re-exports it for the loading side.
+    """
+    return f"{prefix}.{OQH_SIGNS}" in weights
+
+
 def oqh_version(config: dict[str, Any]) -> int | None:
     """The oQh format version of a checkpoint, None when it has no oQh tensors."""
     block = config.get("omlx_oqh")
