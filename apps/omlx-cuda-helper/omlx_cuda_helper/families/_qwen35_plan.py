@@ -16,6 +16,19 @@ from typing import Any
 
 from .. import checkpoint
 
+# This module must not import ``oqh``: that module imports mlx.core, and the
+# daemon runs ``plan()`` in-process, so reaching it from here takes session
+# start down on a box whose MLX is missing or broken.
+#
+# That is a standing constraint on future work, not a note about one commit.
+# The planning surface can no longer use ``oqh`` at all, so when a later oQh
+# change needs a fact here, the fact goes to ``checkpoint`` — which reads the
+# headers without a GPU library — and the GPU-side code stays in ``oqh``.
+# ``is_oqh`` and ``OQH_SIGNS`` moved there for exactly this reason. If someone
+# re-adds the import instead, tests/test_gpu_free_planning.py refuses it, and
+# that refusal is the intended behaviour rather than an obstacle to route
+# around.
+
 CONTRACT = 1
 FIRST_STAGE_MIN = 1
 
