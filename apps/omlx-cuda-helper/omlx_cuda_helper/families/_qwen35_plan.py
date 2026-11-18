@@ -14,10 +14,20 @@ import math
 from pathlib import Path
 from typing import Any
 
-from .. import checkpoint
+from .. import checkpoint, oqh
 
 CONTRACT = 1
 FIRST_STAGE_MIN = 1
+
+# The expert projections a MoE layer banks. The loader joins the first two into
+# one gathered bank and takes the third on its own; the plan refuses oQh signs
+# on either, so both read this one list.
+BANK_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+
+def is_banked(name: str) -> bool:
+    """Whether the loader banks this tensor: a MoE layer's expert projections."""
+    return ".switch_mlp." in name and name.rpartition(".")[2] in BANK_PROJECTIONS
 
 
 def resident(tensor: str) -> bool:
@@ -69,8 +79,13 @@ def plan(model_dir: str | Path) -> tuple[int, list[int]]:
         # An expert bank is 3-D [experts, out, in]; unpacking one to dense
         # 16-bit would multiply the memory estimate by the expert count.
         if len(weight.shape) != 2:
+            # The loader refuses an oQh bank and only ever banks the expert
+            # projections, so the estimate asks its question the same way: a
+            # signed tensor the loader never banks is skipped like any other.
+            if is_banked(base) and oqh.is_oqh(index, base):
+                raise ValueError(f"oQh expert banks are not supported: {name}")
             continue
-        signs = index.get(f"{base}.{checkpoint.OQH_SIGNS}")
+        signs = index.get(f"{base}.{oqh.SIGNS}")
         if signs is not None:
             # oQh: dense weight [N, K]; only the signs stay next to it.
             parts = ("rscale", "oqh_scales", "oqh_biases")

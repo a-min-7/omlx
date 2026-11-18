@@ -12,8 +12,9 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from omlx_cuda_helper import checkpoint, families, tensors  # noqa: E402
+from omlx_cuda_helper import checkpoint, families, oqh, tensors  # noqa: E402
 from omlx_cuda_helper.families import qwen3_5_moe  # noqa: E402
+from omlx_cuda_helper.families.qwen3_5_moe.layers import MoE, Weights  # noqa: E402
 from omlx_cuda_helper.families.qwen3_5_moe.stage import load_stage  # noqa: E402
 
 # Recorded by tests/fixtures/record_prefill_contract.py in the oMLX tree.
@@ -220,3 +221,57 @@ def test_plan_leaves_the_3d_expert_banks_packed(monkeypatch):
     _, unpacked = qwen3_5_moe.plan(model)
     assert len(unpacked) == len(kept)
     assert max(unpacked) > max(kept)
+
+
+def test_a_bank_with_oqh_signs_on_a_later_tensor_is_refused():
+    """The guard reads every projection of the bank, not only the first one.
+
+    ``oqh.is_oqh`` asks about one prefix, so a bank whose first tensor is
+    plain and whose second carries signs would otherwise load in a layout this
+    family cannot read.
+    """
+    root = "language_model.model.layers.0.mlp.switch_mlp."
+    weights = {
+        f"{root}gate_proj.weight": np.zeros((4, 8, 8), np.float32),
+        f"{root}up_proj.weight": np.zeros((4, 8, 8), np.float32),
+        f"{root}up_proj.{oqh.SIGNS}": np.zeros((8, 8), np.float32),
+    }
+    with pytest.raises(ValueError, match="oQh expert banks"):
+        MoE._bank(Weights(weights, {}, root), ("gate_proj", "up_proj"))
+
+
+def test_plan_refuses_only_a_signed_expert_bank(monkeypatch):
+    """The plan asks the loader's question: is a *banked* tensor signed?
+
+    Signs on a tensor the loader never banks — here a 1-D norm gain, which is
+    also not 2-D — are skipped like any other tensor, while a signed
+    ``switch_mlp`` bank is refused. Only the second half would pass against a
+    predicate that keys on the shape and the suffix alone.
+    """
+    model = FIXTURE / "model"
+    index = checkpoint.tensors(model)
+    banks = [
+        name
+        for name, tensor in index.items()
+        if name.endswith(".weight")
+        and ".switch_mlp." in name
+        and len(tensor.shape) == 3
+    ]
+    assert banks, "the fixture records the expert banks"
+    plain = "language_model.model.layers.1.input_layernorm.weight"
+    assert len(index[plain].shape) != 2 and ".switch_mlp." not in plain
+
+    # A signed tensor outside the banks plans exactly as before.
+    skipped = dict(index)
+    skipped[f"{plain.removesuffix('.weight')}.{oqh.SIGNS}"] = index[plain]
+    monkeypatch.setattr(checkpoint, "tensors", lambda _: skipped)
+    shared, layers = qwen3_5_moe.plan(model)
+    assert shared > 0 and layers
+
+    # A signed bank is refused.
+    signed = dict(index)
+    base = banks[0].removesuffix(".weight")
+    signed[f"{base}.{oqh.SIGNS}"] = index[banks[0]]
+    monkeypatch.setattr(checkpoint, "tensors", lambda _: signed)
+    with pytest.raises(ValueError, match="oQh expert banks"):
+        qwen3_5_moe.plan(model)

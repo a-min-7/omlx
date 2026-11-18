@@ -28,6 +28,7 @@ from .._qwen35_layers import (
 from .._qwen35_layers import (
     Layer as _Layer,
 )
+from .._qwen35_plan import BANK_PROJECTIONS
 
 __all__ = [
     "Attention",
@@ -92,8 +93,8 @@ class MoE:
         # mlp.shared_expert.*.
         banks = w.at("switch_mlp")
         # Gate and up share their input rows: one gather computes both.
-        self.gate_up = self._bank(banks, ("gate_proj", "up_proj"))
-        self.down = self._bank(banks, ("down_proj",))
+        self.gate_up = self._bank(banks, BANK_PROJECTIONS[:2])
+        self.down = self._bank(banks, BANK_PROJECTIONS[2:])
         self.combine = None
         self.gather = None
         self.swiglu = None
@@ -105,7 +106,7 @@ class MoE:
 
         Several projections of the same input are joined along their outputs.
         """
-        if oqh.is_oqh(w.arrays, w.root + names[0]):
+        if any(oqh.is_oqh(w.arrays, w.root + name) for name in names):
             # An oQh bank is a different packed layout; reading it as dense
             # would load the packed codes as weights without saying so.
             raise ValueError("oQh expert banks are not supported by this family")

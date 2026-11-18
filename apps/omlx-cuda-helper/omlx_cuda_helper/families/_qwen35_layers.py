@@ -305,6 +305,11 @@ class Attention:
         cache.append(rotate(keys, positions, frequencies), values.transpose(0, 2, 1, 3))
         output = self.attend(queries, cache.keys, cache.values)
         gate = mx.sigmoid(gate.reshape(1, rows, -1))
+        # Not fused, unlike ``finish`` and the MLP: this mirrors the host's own
+        # path, where an oQh o_proj rotates its input inside the linear
+        # (``tensors.Linear.__call__``), so the product is rotated exactly once.
+        # ``oqh``'s fused helpers cover the other two patterns (a norm and a
+        # gate, or a scaled activation), not this one.
         return self.o_proj(output.reshape(1, rows, -1) * gate)
 
 
