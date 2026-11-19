@@ -377,7 +377,17 @@ def model_health(settings: Any, status: dict | None) -> dict:
             "fallback_reason": reason,
             "arming": armed,
         }
-    peer = ((status or {}).get("peer")) or {}
+    status = status or {}
+    if "peer" not in status:
+        # The pre-load (FilePrep) surface carries no liveness record at all:
+        # nothing observed the Mac, so it cannot be called unreachable. This
+        # is what made an armed model with missing files read "unreachable".
+        return {
+            "prefill_path": health.LOCAL,
+            "fallback_reason": str(state),
+            "arming": armed,
+        }
+    peer = status.get("peer") or {}
     if peer.get("reachable"):
         # Reachable but in a state with no named cause: say the state, not a
         # connection failure that nobody observed.

@@ -14,20 +14,20 @@ three, and the reason travels with it:
 * ``OFFLINE`` — a probe timed out or a connection broke; a retry is scheduled.
 * ``REFUSED`` — the helper answered and said no (version, pairing, memory); a
   retry cannot fix it, so it must not feed the same backoff as a timeout.
-* ``ONLINE`` — the manager connected and is serving, or discovery announced
-  the Mac.
+* ``ONLINE`` — the manager connected and the helper is serving. Discovery's
+  announce is **not** this: it records ``last_seen_at`` only.
 
-Those two ONLINEs are not equal. An mDNS announce proves the *Mac* is up, not
-that its daemon answers or that it still serves this model, so a discovery
-observation is **non-authoritative** and records only ``last_seen_at``: it
-wakes the waiter (an offline→online edge is worth one immediate retry) but
-never rewrites the status, its source, ``refused`` or the retry schedule. Only
-a successful connection to the daemon may claim health — and it is the only
-thing that can retract a refusal.
+An mDNS announce proves the *Mac* is up, not that its daemon answers or that
+it still serves this model, so a discovery observation is
+**non-authoritative**: it wakes the waiter (one announce after a failure is
+worth one immediate retry) but never rewrites the status, its source,
+``refused`` or the retry schedule. Only a successful connection to the daemon
+may claim health — and it is the only thing that can retract a refusal.
 
 A peer that goes from ``OFFLINE``/``REFUSED`` back to ``ONLINE`` wakes exactly
 one waiter, once per edge: an mDNS announce every few seconds must not reset
-the backoff on each announce, only the first return.
+the backoff on each announce, only the first return. An announce answers
+"seen" once per outage, so a storm is one edge, not one per packet.
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def observe(
     authoritative: bool = True,
     now: float | None = None,
 ) -> bool:
-    """Record what was seen; True when this is an offline -> online edge.
+    """Record what was seen; True when this observation ends an outage.
 
     A first observation of a peer that was never seen is not an edge: a
     process starting up should not fire a retry for every paired Mac.
@@ -117,6 +117,10 @@ def observe(
     status, its source, ``refused`` and the retry schedule all stand. The Mac
     being up does not mean its helper serves this model, and it must not
     overwrite what a connection actually established.
+
+    The edge is consumed: the first sighting after a failure is the edge,
+    and the rest of that outage's announces return False until a new failure
+    starts another one — so a caller counting edges counts outages.
     """
     at = _now() if now is None else now
     with _LOCK:
@@ -129,15 +133,22 @@ def observe(
                 peer.attempt, peer.next_retry_at = 0, None
             else:
                 peer.last_error = reason
+                # A fresh failure starts a fresh outage, so the next
+                # announce is the edge again.
+                peer.last_seen_at = None
                 if status == REFUSED:
                     # No automatic retry is scheduled, so nothing wakes the
                     # manager on its own; the peer is as reachable as it gets.
                     peer.next_retry_at = None
+            edge = status == ONLINE and before in (OFFLINE, REFUSED)
         else:
             # A sighting, not an attempt and not an observation of the
             # daemon: last_attempt_at stays, and so does everything above.
+            unseen = peer.last_seen_at is None
             peer.last_seen_at = at
-        edge = status == ONLINE and before in (OFFLINE, REFUSED)
+            # One edge per outage: an announce storm is one sighting, and a
+            # refusal is not something a sighting can retract.
+            edge = before == OFFLINE and unseen
         callbacks: list[Callable[[], None]] = _WAITERS.pop(node_id, []) if edge else []
     # Outside the lock: a waiter may start work that observes this peer again.
     for callback in callbacks:
@@ -192,19 +203,22 @@ def stop_waiting(node_id: str, callback: Callable[[], None]) -> None:
 
 
 def announce_peer(peer: Any) -> None:
-    """A discovery change callback: an announced peer counts as reachable.
+    """A discovery change callback: record a sighting and wake the waiter.
 
     ``peer.state`` is discovery's own vocabulary (``discovered``, ``suspect``,
-    ``dead``); only the healthy one feeds this record, and only the first one
-    after an outage wakes the manager.
+    ``dead``); only the healthy one is considered. The sighting is
+    non-authoritative: it does not make the record ONLINE or reachable — the
+    manager's connection does that — and it wakes the manager once per
+    outage (``observe`` returns whether a given sighting was that edge).
     """
     if getattr(peer, "state", None) != "discovered":
         return
     node_id = getattr(peer, "node_id", None)
-    if node_id:
-        # The Mac answered mDNS, not the daemon: an edge worth one retry,
-        # but not proof that this model's helper is serving again.
-        observe(str(node_id), ONLINE, source="discovery", authoritative=False)
+    if not node_id:
+        return
+    # The Mac answered mDNS, not the daemon: an edge worth one retry, but
+    # not proof that this model's helper is serving again.
+    observe(str(node_id), ONLINE, source="discovery", authoritative=False)
 
 
 def reset() -> None:

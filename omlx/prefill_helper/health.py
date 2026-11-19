@@ -36,8 +36,12 @@ NEEDS_FILES = "needs_files"
 COPYING = "copying"
 STARTING = "starting"
 STOPPED = "stopped"
+FILES_READY = "files_ready"
+FILES_MISSING = "files_missing"
 
-# The manager's non-serving states where the Mac is not an unanswered one.
+# Every non-serving state where the Mac is not an unanswered one. The last
+# two come from the FilePrep surface, which runs before a model loads and has
+# no peer record at all — without them it fell through to "unreachable".
 STATE_REASONS = {
     "off": STARTING,
     "connecting": STARTING,
@@ -45,6 +49,8 @@ STATE_REASONS = {
     "needs_files": NEEDS_FILES,
     "copying": COPYING,
     "stopped": STOPPED,
+    "files_ready": FILES_READY,
+    "files_missing": FILES_MISSING,
 }
 
 # The two arming keys, in the order the settings module declares them.

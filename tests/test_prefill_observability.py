@@ -258,6 +258,12 @@ def test_an_announce_ends_an_outage_without_claiming_health():
     peers.announce_peer(announce)
     peers.announce_peer(announce)
     assert calls == [1]
+    # The return describes the edge, once per outage — a caller counting
+    # edges counts outages, not packets (observe is the return's owner).
+    peers.offline("m", "timed out")
+    sighting = {"source": "discovery", "authoritative": False}
+    assert peers.observe("m", peers.ONLINE, **sighting) is True
+    assert peers.observe("m", peers.ONLINE, **sighting) is False
 
 
 def test_a_node_change_does_not_lose_the_discovery_wake(monkeypatch):
@@ -689,6 +695,28 @@ def test_a_reachable_mac_names_its_own_state_not_unreachable(
     payload = client.get("/admin/api/prefill-helper/models/loaded").json()
     assert payload["prefill_path"] == "local"
     assert payload["fallback_reason"] == reason
+    assert payload["fallback_reason"] != "unreachable"
+
+
+@pytest.mark.parametrize("state", ["files_missing", "files_ready"])
+def test_the_pre_load_surface_names_its_state_not_unreachable(monkeypatch, state):
+    """FilePrep runs before a model loads and carries no peer record.
+
+    The reachable branch needs ``status["peer"]``, which this surface never
+    provides, so both of its states fell through to "unreachable" — the exact
+    defect F2 fixed on the loaded path, on the one path it did not reach.
+    """
+    from omlx.prefill_helper import routes as helper_routes
+
+    monkeypatch.setattr(
+        helper_routes,
+        "file_prep",
+        lambda path: SimpleNamespace(status=lambda: {"state": state}),
+    )
+    client = _app(monkeypatch, None, _armed())
+    payload = client.get("/admin/api/prefill-helper/models/idle").json()
+    assert payload["state"] == state
+    assert payload["fallback_reason"] == state
     assert payload["fallback_reason"] != "unreachable"
 
 
