@@ -405,18 +405,60 @@ def model_health(settings: Any, status: dict | None) -> dict:
     }
 
 
-@router.get("/models/{model_id}")
-async def model_status(model_id: str) -> dict:
-    entry = _entry(model_id)
+def status_payload(
+    entry: Any, settings: Any = None, model_id: str | None = None
+) -> dict:
+    """The one payload every surface that reports helper status returns (#91).
+
+    Four routes return this: the model status, the two action paths and the
+    admin model list. Before, three of them returned the bare status, so an
+    operator reading one of those saw a shape without ``prefill_path`` and
+    concluded the model was fine — which is the invisibility #79 exists to
+    end. Additive fields must land everywhere people look.
+
+    ``model_id`` is the route's own id (the key the scheduler counts under);
+    the entry's is the fallback for a caller that only has one.
+    """
     status = helper_status(entry)
+    if not isinstance(status, dict):
+        # helper_status returns a dict or None; anything else is a caller that
+        # handed us a stand-in entry. Report unloaded rather than raise.
+        status = None
     payload: dict[str, Any] = dict(status) if status else {"state": "unloaded"}
-    payload.update(model_health(_saved_settings(model_id), status))
+    payload.update(model_health(settings, status))
     # This model's counts only: the counters are keyed by model, so another
     # model's traffic cannot appear under this one.
-    payload["counters"] = health.snapshot(model_id)
+    key = model_id if model_id is not None else getattr(entry, "model_id", None)
+    payload["counters"] = health.snapshot(key)
     return payload
 
 
+@router.get("/models/{model_id}")
+async def model_status(model_id: str) -> dict:
+    entry = _entry(model_id)
+    return status_payload(entry, _saved_settings(model_id), model_id)
+
+
+@router.post("/models/{model_id}/rearm")
+async def model_rearm(model_id: str) -> dict:
+    """Restart this model's helper even when the saved arming did not change.
+
+    A PUT with the same ``prefill_helper_layers`` is idempotent and does not
+    re-arm (manager.configure compares the tuple), so re-applying the saved
+    configuration cannot recover a wedged helper. This endpoint forces the
+    restart the PUT deliberately skips (#86 c).
+    """
+    entry = _entry(model_id)
+    manager = getattr(entry.engine, "prefill_helper", None)
+    if manager is None:
+        raise HTTPException(
+            status_code=409, detail="Load the model to re-arm its helper."
+        )
+    manager.rearm()
+    return status_payload(entry, _saved_settings(model_id), model_id)
+
+
+# Declared before the ``{action}`` route so ``/rearm`` is not read as one.
 @router.post("/models/{model_id}/{action}")
 async def model_action(model_id: str, action: str) -> dict:
     if action not in ("check", "copy", "retry", "stop"):
@@ -428,7 +470,7 @@ async def model_action(model_id: str, action: str) -> dict:
             {"copy": manager.copy_files, "retry": manager.retry, "stop": manager.stop}[
                 action
             ]()
-        return manager.status()
+        return status_payload(entry, _saved_settings(model_id), model_id)
     prep = file_prep(entry.model_path)
     if action == "check":
         # Whether a saved helper already has the files; nothing is copied.
@@ -442,7 +484,7 @@ async def model_action(model_id: str, action: str) -> dict:
                 getattr(settings, "prefill_helper_layers", None),
                 check_only=True,
             )
-        return helper_status(entry) or {"state": "unloaded"}
+        return status_payload(entry, _saved_settings(model_id), model_id)
     if prep is None:
         raise HTTPException(
             status_code=409, detail="Load the model to use the Prefill Accelerator."
@@ -453,7 +495,7 @@ async def model_action(model_id: str, action: str) -> dict:
         prep.cancel()
     else:
         prepare(entry.model_path, prep.adapter, prep.node_id, prep.layers, restart=True)
-    return helper_status(entry) or {"state": "unloaded"}
+    return status_payload(entry, _saved_settings(model_id), model_id)
 
 
 @router.get("/lending")

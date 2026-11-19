@@ -4,6 +4,7 @@
 import asyncio
 import copy
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pydantic
@@ -595,6 +596,58 @@ async def test_prefill_helper_choice_needs_a_model_that_gets_a_helper():
         entry.engine_type = "vlm"
         await _update_settings(pool, settings, request)
     assert settings.prefill_helper_node_id == "m5"
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_arming_says_it_did_not_rearm():
+    """#86 c: the PUT stays idempotent, but the response says nothing happened.
+
+    A same-k PUT is skipped by the manager's (node, layers, a8) comparison,
+    so re-applying the saved configuration cannot recover a wedged helper;
+    the response must not read as if it had.
+    """
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    entry.engine_type = "vlm"
+    entry.engine = SimpleNamespace(configure_prefill_helper=MagicMock())
+    settings = ModelSettings(prefill_helper_node_id="m5", prefill_helper_layers=24)
+    request = admin_routes.ModelSettingsRequest(
+        prefill_helper_node_id="m5", prefill_helper_layers=24
+    )
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        result = await _update_settings(pool, settings, request)
+
+    assert result["prefill_helper"] == {"applied": False, "reason": "unchanged"}
+    entry.engine.configure_prefill_helper.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_changed_arming_says_it_rearmed():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    entry.engine_type = "vlm"
+    entry.engine = SimpleNamespace(configure_prefill_helper=MagicMock())
+    settings = ModelSettings(prefill_helper_node_id="m5", prefill_helper_layers=24)
+    request = admin_routes.ModelSettingsRequest(prefill_helper_layers=12)
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        result = await _update_settings(pool, settings, request)
+
+    assert result["prefill_helper"] == {"applied": True, "reason": "changed"}
+    assert settings.prefill_helper_layers == 12
+
+
+@pytest.mark.asyncio
+async def test_a_put_that_does_not_touch_the_arming_reports_nothing():
+    pool, entry = _failed_pool()
+    settings = ModelSettings(prefill_helper_node_id="m5", prefill_helper_layers=24)
+
+    result = await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(temperature=0.3)
+    )
+
+    assert result["prefill_helper"] is None
 
 
 @pytest.mark.asyncio

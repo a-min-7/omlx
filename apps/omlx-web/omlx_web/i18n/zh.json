@@ -514,6 +514,7 @@
   "settings.global.restart_notice": "标有",
   "settings.global.restart_badge": "重启",
   "settings.global.restart_suffix": "的设置需要重启服务器。",
+  "settings.global.restart_required_banner": "Saved. Restart required for: {keys}.",
   "settings.integrations.section_label": "集成",
   "settings.integrations.heading": "集成设置",
   "settings.integrations.description": "配置文档预处理和外部工具集成。",

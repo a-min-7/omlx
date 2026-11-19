@@ -78,6 +78,7 @@ from ..model_profiles import (
 from ..model_settings import (
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
     ModelSettings,
+    a8_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
     resolve_qwen35_prefill_conflicts,
@@ -95,8 +96,8 @@ from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
-from ..prefill_helper.routes import helper_status as prefill_helper_status
 from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
+from ..prefill_helper.routes import status_payload as prefill_helper_payload
 from ..request import live_decode_rate
 from ..settings import (
     BURST_DECODE_MODES,
@@ -2416,7 +2417,14 @@ def reasoning_levels(model_info: dict) -> list[str]:
 def _prefill_helper_status(model_id: str) -> dict | None:
     engine_pool = _get_engine_pool()
     entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
-    return prefill_helper_status(entry) if entry is not None else None
+    if entry is None:
+        return None
+    # The same serializer as the Prefill Accelerator's own routes (#91): an
+    # operator reading the model list must see prefill_path/fallback_reason
+    # too, or a lost arming is invisible on the surface they look at.
+    settings_manager = _get_settings_manager()
+    settings = settings_manager.get_settings(model_id) if settings_manager else None
+    return prefill_helper_payload(entry, settings, model_id)
 
 
 def _model_options(model_info: dict, settings) -> dict:
@@ -2965,6 +2973,23 @@ async def reload_models(is_admin: bool = Depends(require_admin)):
     raise HTTPException(status_code=500, detail=message)
 
 
+def _prefill_arming(settings: Any) -> tuple:
+    """The tuple ``PrefillHelperManager.configure`` compares (#86 c).
+
+    Mirroring it is what lets the PUT say honestly whether a save re-armed
+    the helper: an identical tuple is skipped by design, and the response
+    must not read as if something happened.
+    """
+    a8 = None
+    if a8_prefill_on(settings):
+        a8 = int(getattr(settings, "a8_prefill_min_tokens", 128))
+    return (
+        getattr(settings, "prefill_helper_node_id", None),
+        getattr(settings, "prefill_helper_layers", None),
+        a8,
+    )
+
+
 @router.put("/api/models/{model_id}/settings")
 async def update_model_settings(
     model_id: str,
@@ -3001,6 +3026,9 @@ async def update_model_settings(
 
     # Get current settings
     current_settings = settings_manager.get_settings(model_id)
+    # Before any field is applied: what the helper was armed with. The PUT
+    # that follows may be a no-op for the helper even though it saves (#86 c).
+    arming_before = _prefill_arming(current_settings)
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
@@ -3641,12 +3669,21 @@ async def update_model_settings(
     if not _oq_a8_kernels_available():
         # A8 here reaches only the helper's layers.
         helper_fields |= {"a8_prefill_enabled", "a8_prefill_min_tokens"}
+    prefill_helper_result: dict[str, Any] | None = None
     if helper_fields & set(sent):
         if hasattr(entry.engine, "configure_prefill_helper"):
             # Applied to the loaded model in place; no reload.
             entry.engine.configure_prefill_helper(current_settings)
         else:
             prepare_prefill_helper(entry, current_settings)
+        # The manager skips an identical (node, layers, a8) on purpose, so
+        # the save is idempotent — but the response must not imply it
+        # re-armed. POST .../rearm is the explicit restart.
+        rearmed = _prefill_arming(current_settings) != arming_before
+        prefill_helper_result = {
+            "applied": rearmed,
+            "reason": "changed" if rearmed else "unchanged",
+        }
 
     # A failed load is cached to prevent clients from retrying the same broken
     # configuration on every request. Clear that cache only when the effective
@@ -3720,6 +3757,8 @@ async def update_model_settings(
         "auto_unloaded": auto_unloaded,
         "auto_reloaded": auto_reloaded,
         "reload_deferred": reload_deferred,
+        # None when this PUT did not touch the arming.
+        "prefill_helper": prefill_helper_result,
     }
 
 
@@ -5038,6 +5077,200 @@ def _global_settings_response(global_settings):
     }
 
 
+# The runtime-applied label a request field is covered by, when it differs
+# from the field's own name. A field not listed here is its own label.
+_RUNTIME_FIELD_LABELS = {
+    "memory_prefill_memory_guard": "prefill_memory_guard",
+    # Applied with the tier it belongs to.
+    "memory_guard_custom_ceiling_gb": "memory_guard_tier",
+    "decode_fairness": "concurrent_priority",
+    "cache_enabled": "cache",
+    "hot_cache_max_size": "cache",
+    "claude_code_desktop_enabled": "claude_code",
+}
+_RUNTIME_FIELD_PREFIXES = (
+    ("network_", "network"),
+    ("sampling_", "sampling"),
+    ("claude_code_", "claude_code"),
+    ("integrations_", "integrations"),
+    ("markitdown_", "integrations"),
+    ("web_search_", "integrations"),
+    # The handler sets integrations_changed for every splash field too, so
+    # they are covered by the same label.
+    ("splash_", "integrations"),
+)
+# A request flag that is a side effect, not a saved setting.
+_NON_SETTING_FIELDS = {"restart_desktop"}
+
+
+def _runtime_label(field: str) -> str:
+    label = _RUNTIME_FIELD_LABELS.get(field)
+    if label is not None:
+        return label
+    for prefix, group in _RUNTIME_FIELD_PREFIXES:
+        if field.startswith(prefix):
+            return group
+    return field
+
+
+_MISSING = object()
+
+# Request field -> (settings group, attribute), for the fields whose name
+# differs from the one the handler reads. Every other field is found by its
+# own name in one of the groups below; grouped names strip their prefix.
+_FIELD_ALIASES = {
+    "memory_prefill_memory_guard": ("memory", "prefill_memory_guard"),
+    "decode_fairness": ("scheduler", "decode_fairness"),
+    "cache_enabled": ("cache", "enabled"),
+    "gdn_snapshot_storage": ("cache", "get_gdn_snapshot_storage"),
+    "gdn_sidecar_precision": ("cache", "gdn_sidecar_state_dtype"),
+    "mcp_config": ("mcp", "config_path"),
+    "mcp_expose_tools": ("mcp", "expose_tools"),
+    "hf_endpoint": ("huggingface", "endpoint"),
+    "ms_endpoint": ("modelscope", "endpoint"),
+    "ui_language": ("ui", "language"),
+    "ui_dashboard_layout": ("ui", "dashboard_layout"),
+    "ui_custom_theme": ("ui", "custom_theme"),
+}
+_FIELD_PREFIXES = (
+    ("network_", "network", True),
+    ("sampling_", "sampling", True),
+    ("claude_code_", "claude_code", True),
+    ("integrations_", "integrations", True),
+)
+# Tried in order for an un-prefixed field; the first group that has the
+# attribute is the one the handler reads.
+_FIELD_GROUPS = (
+    "server",
+    "model",
+    "memory",
+    "scheduler",
+    "cache",
+    "mcp",
+    "usage",
+    "huggingface",
+    "modelscope",
+    "network",
+    "sampling",
+    "auth",
+    "claude_code",
+    "integrations",
+    "ui",
+    "idle_timeout",
+)
+
+
+def _previous_value(global_settings: Any, field: str) -> Any:
+    """One request field's value before the request mutates the settings.
+
+    The dashboard posts the whole form on every save, so a field whose runtime
+    label is absent is only pending if its *value* changed. This resolves the
+    saved value the same way the GET renders it, where the two differ.
+    """
+    if field in _NON_SETTING_FIELDS:
+        return _MISSING
+    if field == "model_dirs":
+        # The GET and the dashboard render the configured defaults.
+        try:
+            return [
+                str(d)
+                for d in global_settings.model.get_model_dirs(
+                    global_settings.base_path
+                )
+            ]
+        except Exception:
+            return _MISSING
+    if field == "ssd_cache_dir":
+        # The GET renders `ssd_cache_dir or base_path/"cache"`; compare with
+        # that, not the raw None the saved settings hold.
+        try:
+            raw = global_settings.cache.ssd_cache_dir
+            if raw:
+                return raw
+            cache_dir = global_settings.cache.get_ssd_cache_dir(
+                global_settings.base_path
+            )
+            return str(cache_dir)
+        except Exception:
+            return _MISSING
+
+    target = _FIELD_ALIASES.get(field)
+    if target is None:
+        for prefix, group, strip in _FIELD_PREFIXES:
+            if field.startswith(prefix):
+                target = (group, field[len(prefix):] if strip else field)
+                break
+    if target is None:
+        for group in _FIELD_GROUPS:
+            section = getattr(global_settings, group, None)
+            if section is not None and hasattr(section, field):
+                target = (group, field)
+                break
+    if target is None:
+        return _MISSING
+
+    section = getattr(global_settings, target[0], None)
+    if section is None:
+        return _MISSING
+    value = getattr(section, target[1], _MISSING)
+    if callable(value):
+        try:
+            return value()
+        except Exception:
+            return _MISSING
+    return value
+
+
+def _restart_values(global_settings: Any) -> dict[str, Any]:
+    """Snapshot every field the pending comparison can consult."""
+    return {
+        field: _previous_value(global_settings, field)
+        for field in GlobalSettingsRequest.model_fields
+    }
+
+
+def _same_restart_value(field: str, old: Any, new: Any) -> bool:
+    if field == "gdn_snapshot_storage":
+        aliases = {"ssd": "ssd_sidecar", "hot": "embedded"}
+
+        def norm(value: Any) -> str:
+            text = str(value).strip().lower()
+            return aliases.get(text, text)
+
+        return norm(old) == norm(new)
+    if field == "gdn_sidecar_precision":
+        return str(old).lower() == str(new).lower()
+    if field in ("ssd_cache_dir", "splash_path"):
+        return str(old or "").strip() == str(new or "").strip()
+    return old == new
+
+
+def _pending_restart(
+    request: Any, runtime_applied: list[str], previous: dict[str, Any]
+) -> list[str]:
+    """Saved fields the request did not apply at runtime (#87).
+
+    ``runtime_applied`` is the backend's own statement of what took effect.
+    A field it does not cover is dark until the server is restarted, and
+    silence about that let enabling a feature report success while it stayed
+    off. Only a field whose value actually changed is reported, because the
+    dashboard resends the entire form.
+    """
+    applied = set(runtime_applied)
+    changed = set(request.model_fields_set) - _NON_SETTING_FIELDS
+    pending = []
+    for field in changed:
+        if _runtime_label(field) in applied:
+            continue
+        old = previous.get(field, _MISSING)
+        if old is not _MISSING and _same_restart_value(
+            field, old, getattr(request, field)
+        ):
+            continue
+        pending.append(field)
+    return sorted(pending)
+
+
 @router.post("/api/global-settings")
 async def update_global_settings(
     request: GlobalSettingsRequest,
@@ -5064,6 +5297,10 @@ async def update_global_settings(
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
+
+    # Snapshot before anything is applied: the pending-restart set is a value
+    # comparison, because the dashboard resends the whole form (#87).
+    previous_restart_values = _restart_values(global_settings)
 
     # Infinity would persist and break JSON encoding of the settings response.
     for name in ("gpu_keep_warm_interval", "gpu_keep_warm_idle_window"):
@@ -6263,13 +6500,25 @@ async def update_global_settings(
             logger.warning("Claude Desktop auto-config failed: %s", exc)
             claude_desktop_result = {"applied": False, "error": str(exc)}
 
-    # Build response message
+    # Build response message. A saved setting that was not applied at runtime
+    # is dark until the server restarts; success stays true, but the message
+    # and pending_restart say so instead of letting the save read as live.
+    pending_restart = _pending_restart(
+        request, runtime_applied, previous_restart_values
+    )
     message = "Settings saved successfully."
+    if pending_restart:
+        message = (
+            "Settings saved. Restart required for: "
+            + ", ".join(pending_restart)
+            + "."
+        )
 
     return {
         "success": True,
         "message": message,
         "runtime_applied": runtime_applied,
+        "pending_restart": pending_restart,
         "claude_desktop": claude_desktop_result,
     }
 

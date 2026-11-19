@@ -279,6 +279,8 @@
             saveSuccess: false,
             saveMessage: '',
             saveError: '',
+            // Saved settings the backend did not apply at runtime (#87).
+            restartRequired: [],
 
             // Model settings modal
             showModelSettingsModal: false,
@@ -1411,6 +1413,7 @@
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
+                this.restartRequired = [];
 
                 // Validate required fields
                 const errors = [];
@@ -1522,6 +1525,10 @@
                         const data = await response.json();
                         this.saveSuccess = true;
                         this.saveMessage = data.message || window.t('js.success.settings_saved');
+                        // Saved, but not in effect until a restart (#87).
+                        this.restartRequired = Array.isArray(data.pending_restart)
+                            ? data.pending_restart
+                            : [];
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
