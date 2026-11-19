@@ -14,7 +14,14 @@ three, and the reason travels with it:
 * ``OFFLINE`` — a probe timed out or a connection broke; a retry is scheduled.
 * ``REFUSED`` — the helper answered and said no (version, pairing, memory); a
   retry cannot fix it, so it must not feed the same backoff as a timeout.
-* ``ONLINE`` — a probe reached it, or discovery announced it.
+* ``ONLINE`` — the manager connected and is serving, or discovery announced
+  the Mac.
+
+Those two ONLINEs are not equal. An mDNS announce proves the *Mac* is up, not
+that its daemon answers or that it still serves this model, so a discovery
+observation is **non-authoritative**: it wakes the waiter (an offline→online
+edge is worth one immediate retry) but it neither clears the retry schedule
+nor claims ``last_ok_at``. Only a successful connection to the daemon does.
 
 A peer that goes from ``OFFLINE``/``REFUSED`` back to ``ONLINE`` wakes exactly
 one waiter, once per edge: an mDNS announce every few seconds must not reset
@@ -43,19 +50,28 @@ class PeerState:
     last_error: str | None = None
     last_attempt_at: float | None = None
     last_ok_at: float | None = None
+    # Discovery saw the Mac up; it does not say the daemon serves.
+    last_seen_at: float | None = None
     attempt: int = 0
     next_retry_at: float | None = None
     source: str | None = None
+
+    @property
+    def serving(self) -> bool:
+        """The daemon answered, not merely the Mac's mDNS responder."""
+        return self.status == ONLINE and self.source not in (None, "discovery")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "node_id": self.node_id,
             "status": self.status,
             "reachable": None if self.status is None else self.status == ONLINE,
+            "serving": self.serving,
             "refused": self.status == REFUSED,
             "last_error": self.last_error,
             "last_attempt_at": self.last_attempt_at,
             "last_ok_at": self.last_ok_at,
+            "last_seen_at": self.last_seen_at,
             "source": self.source,
         }
 
@@ -85,12 +101,19 @@ def observe(
     *,
     reason: str | None = None,
     source: str = "probe",
+    authoritative: bool = True,
     now: float | None = None,
 ) -> bool:
-    """Record what a probe saw; True when this is an offline -> online edge.
+    """Record what was seen; True when this is an offline -> online edge.
 
     A first observation of a peer that was never seen is not an edge: a
     process starting up should not fire a retry for every paired Mac.
+
+    ``authoritative=False`` is for evidence weaker than a connection to the
+    daemon (an mDNS announce). It can end an outage — the edge fires and a
+    retry follows — but it must not clear a retry schedule or claim
+    ``last_ok_at``, because the Mac being up does not mean its helper serves
+    this model.
     """
     at = _now() if now is None else now
     with _LOCK:
@@ -98,8 +121,11 @@ def observe(
         before = peer.status
         peer.status, peer.source, peer.last_attempt_at = status, source, at
         if status == ONLINE:
-            peer.last_ok_at, peer.last_error = at, None
-            peer.attempt, peer.next_retry_at = 0, None
+            if authoritative:
+                peer.last_ok_at, peer.last_error = at, None
+                peer.attempt, peer.next_retry_at = 0, None
+            else:
+                peer.last_seen_at = at
         else:
             peer.last_error = reason
             if status == REFUSED:
@@ -171,7 +197,9 @@ def announce_peer(peer: Any) -> None:
         return
     node_id = getattr(peer, "node_id", None)
     if node_id:
-        observe(str(node_id), ONLINE, source="discovery")
+        # The Mac answered mDNS, not the daemon: an edge worth one retry,
+        # but not proof that this model's helper is serving again.
+        observe(str(node_id), ONLINE, source="discovery", authoritative=False)
 
 
 def reset() -> None:

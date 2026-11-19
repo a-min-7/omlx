@@ -13,7 +13,7 @@ An absent value is never a mismatch: an older helper does not send them, and
 
 from __future__ import annotations
 
-from . import COMMIT, PLAN_API_VERSION
+from . import PLAN_API_VERSION, commit
 
 
 def plan_mismatch(info: dict, name: str = "the helper") -> str | None:
@@ -31,7 +31,9 @@ def plan_mismatch(info: dict, name: str = "the helper") -> str | None:
 def source_mismatch(
     info: dict, name: str = "the helper", *, ours: str | None = None
 ) -> str | None:
-    theirs, ours = info.get("commit"), COMMIT if ours is None else ours
+    # Resolved at call time: an import-time constant read the environment
+    # before the packaging could set it and reported "unknown" forever.
+    theirs, ours = info.get("commit"), commit() if ours is None else ours
     if not theirs or not ours or "unknown" in (str(theirs), ours):
         return None
     if str(theirs) == ours:

@@ -847,6 +847,11 @@ class PrefillHelperManager:
             # The contract check passed, so this is the only place a source
             # or plan difference is visible.
             logger.warning("Prefill helper %s: %s", self.node_id, problem)
+        # The capacity the gate reports is the one ``held`` was computed
+        # from: the clamped budgets, with the split limit removed for the
+        # second figure. Neither is a recommendation.
+        budgets = helper_budget(info)
+        shared, per_layer = self.adapter.memory_plan(self.model_path)
         self._set(
             "ready",
             node_id=self.node_id,
@@ -855,7 +860,13 @@ class PrefillHelperManager:
             memory=info.get("memory"),
             on_battery=bool(info.get("on_battery")),
             plan_problem=problem,
-            gate=health.gate(held, info, time.time()),
+            gate=health.gate(
+                held,
+                info,
+                time.time(),
+                budgets=budgets,
+                max_layers=fit_layers(shared, per_layer, budgets, len(per_layer)),
+            ),
         )
 
     def _ask(self, **fields: Any) -> None:
@@ -941,6 +952,10 @@ class PrefillHelperManager:
         self._saved = speeds
 
     def _teardown(self) -> None:
+        # Whatever peer this manager waited on is no longer the armed one:
+        # a configure to another node would otherwise see a stale guard and
+        # never register a waiter for the new peer (the wake is then lost).
+        self._stop_waiting()
         if self._session is not None:
             self._save_speeds()
             self.attach(None)

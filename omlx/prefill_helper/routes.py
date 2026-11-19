@@ -106,16 +106,17 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         target = transport.resolve_target(node_id)
         info = transport.remote_info(target)
     except launcher.LaunchError as error:
-        peers.offline(node_id, str(error), source="candidates")
         return current_peer_row(row, node_id, reason=str(error))
     except (OSError, subprocess.SubprocessError, ValueError) as error:
-        peers.offline(node_id, str(error), source="candidates")
         return current_peer_row(row, node_id, reason=str(error))
-    peers.online(node_id, source="candidates")
+    # A read-only probe must not write the shared liveness record: this
+    # endpoint is polled by the UI, and one failed probe would mark the peer
+    # offline for every model whose manager is ready and serving.
     measured_at = time.time()
     shared, per_layer = adapter.memory_plan(model_path)
     limit = adapter.split_limit(len(per_layer))
-    held = fit_layers(shared, per_layer, helper_budget(info), limit)
+    budgets = helper_budget(info)
+    held = fit_layers(shared, per_layer, budgets, limit)
     lending = info.get("lending")
     if lending:
         lending = {
@@ -125,10 +126,15 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         if lending == {"host": computer_name(), "model": Path(model_path).name}:
             # The helper already runs for this model.
             lending = None
-    gate = health.gate(held, info, measured_at)
+    max_layers = fit_layers(shared, per_layer, budgets, len(per_layer))
+    gate = health.gate(
+        held, info, measured_at, budgets=budgets, max_layers=max_layers
+    )
     return {
         **row,
         "online": True,
+        # What this probe saw; it is not written to the shared peer record.
+        "probe": {"at": measured_at, "ok": True, "reason": None},
         "link": target.link,
         "device": info.get("device"),
         "version": info.get("version"),
@@ -143,8 +149,11 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         "plan_ok": transport.plan_mismatch(info) is None,
         "source_mismatch": transport.source_mismatch(info) is not None,
         "layers_fit": held,
-        "max_layers_fit": held,
-        "budget": info.get("budget"),
+        # The same fit without the family's split limit; not a second name
+        # for layers_fit, and not a recommendation either.
+        "max_layers_fit": max_layers,
+        "budget": sum(budgets),
+        "budgets": budgets,
         "measured_at": measured_at,
         "gate": gate,
         "on_battery": bool(info.get("on_battery")),
@@ -154,13 +163,18 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
 
 
 def current_peer_row(row: dict, node_id: str, *, reason: str) -> dict:
-    """A candidate that did not answer, described by the one peer state."""
+    """A candidate that did not answer, described by the one peer state.
+
+    The failed probe is reported as ``probe``: it dates a sighting, not a
+    measurement, so it carries no ``measured_at`` (there is nothing measured)
+    and it is never written to the shared record.
+    """
     peer = peers.state(node_id)
     return {
         **row,
         "online": False,
         "reason": reason,
-        "measured_at": time.time(),
+        "probe": {"at": time.time(), "ok": False, "reason": reason},
         "peer": peer.to_dict(),
         "backing_off": (
             {
@@ -209,7 +223,12 @@ def _check(node_id: str) -> dict:
         target = transport.resolve_target(node_id)
     except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
         rows.append({"key": transport.VIA, "status": "fail", "detail": str(error)})
-        return {"node_id": node_id, "name": device["friendly_name"], "rows": rows}
+        return {
+            "node_id": node_id,
+            "name": device["friendly_name"],
+            "rows": rows,
+            "probe": {"at": time.time(), "ok": False, "reason": str(error)},
+        }
     rows.append({"key": transport.VIA, "status": "pass", "detail": target.endpoint})
     fast = (
         target.link in ("thunderbolt", "rdma")
@@ -226,10 +245,16 @@ def _check(node_id: str) -> dict:
     try:
         info = transport.remote_info(target, host=this_host())
     except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
-        peers.offline(node_id, str(error), source="check")
+        # The same rule as ``/candidates``: a read-only check reports what it
+        # saw and never writes the shared peer record that a serving manager
+        # owns.
         rows.append({"key": "version", "status": "fail", "detail": str(error)})
-        return {"node_id": node_id, "name": target.name, "rows": rows}
-    peers.online(node_id, source="check")
+        return {
+            "node_id": node_id,
+            "name": target.name,
+            "rows": rows,
+            "probe": {"at": time.time(), "ok": False, "reason": str(error)},
+        }
     theirs = info.get("link_mbps")
     if theirs and target.speed_mbps and theirs < target.speed_mbps:
         # A helper daemon reports the speed of its own end; the slower end
@@ -274,7 +299,12 @@ def _check(node_id: str) -> dict:
         rows.append(
             {"key": "power", "status": "warn" if info["on_battery"] else "pass"}
         )
-    return {"node_id": node_id, "name": target.name, "rows": rows}
+    return {
+        "node_id": node_id,
+        "name": target.name,
+        "rows": rows,
+        "probe": {"at": time.time(), "ok": True, "reason": None},
+    }
 
 
 @router.get("/check")
@@ -327,6 +357,14 @@ def model_health(settings: Any, status: dict | None) -> dict:
             "fallback_reason": armed["reason"],
             "arming": armed,
         }
+    if state in (None, "unloaded"):
+        # Armed, but this model was never loaded: no manager has tried, so
+        # "unreachable" would name a cause nobody observed.
+        return {
+            "prefill_path": health.LOCAL,
+            "fallback_reason": health.NOT_LOADED,
+            "arming": armed,
+        }
     peer = ((status or {}).get("peer")) or {}
     return {
         "prefill_path": health.LOCAL,
@@ -343,7 +381,9 @@ async def model_status(model_id: str) -> dict:
     status = helper_status(entry)
     payload: dict[str, Any] = dict(status) if status else {"state": "unloaded"}
     payload.update(model_health(_saved_settings(model_id), status))
-    payload["counters"] = health.snapshot()
+    # This model's counts only: the counters are keyed by model, so another
+    # model's traffic cannot appear under this one.
+    payload["counters"] = health.snapshot(model_id)
     return payload
 
 

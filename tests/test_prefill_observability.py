@@ -26,11 +26,15 @@ from omlx.prefill_helper.session import PrefillHelperSession
 
 @pytest.fixture(autouse=True)
 def _clean_state():
+    import omlx.prefill_helper as helper_pkg
+
     peers.reset()
     health.reset()
+    helper_pkg._COMMIT = None
     yield
     peers.reset()
     health.reset()
+    helper_pkg._COMMIT = None
 
 
 def _armed(node="helper-mac", layers=24):
@@ -172,11 +176,84 @@ def test_backoff_reads_as_a_schedule_not_as_a_silent_mac(monkeypatch):
     while not starts and time.time() < deadline:
         time.sleep(0.01)
     assert starts == [1]
+    # The Mac's mDNS answer is not the daemon: the retry schedule stays
+    # reported until a connection actually succeeds.
+    assert manager.status()["backing_off"] is not None
+    assert manager.status()["peer"]["serving"] is False
     # Every later announce is not another retry.
     peers.announce_peer(announce)
     peers.announce_peer(announce)
     time.sleep(0.1)
     assert starts == [1]
+    manager.close()
+
+
+def test_only_a_connected_helper_clears_the_reported_schedule():
+    """An announce is weaker evidence than a connection (finding 9)."""
+    peers.offline("n", "timed out")
+    peers.backing_off("n", 2, 30.0)
+    peers.announce_peer(SimpleNamespace(state="discovered", node_id="n"))
+    state = peers.state("n")
+    assert (state.status, state.attempt) == ("online", 2)
+    assert state.next_retry_at is not None
+    assert state.to_dict()["serving"] is False
+    # The manager connected and is serving: now the schedule is gone.
+    peers.online("n")
+    assert (peers.state("n").attempt, peers.state("n").next_retry_at) == (0, None)
+    assert peers.state("n").to_dict()["serving"] is True
+
+
+def test_a_node_change_does_not_lose_the_discovery_wake(monkeypatch):
+    """Backoff A, switch to B, backoff B, announce B: the retry must run.
+
+    The one-waiter-per-outage guard lived on the manager, so a configure to
+    another node left it set and registered no waiter for the new peer; the
+    announce then woke nobody.
+    """
+    starts = []
+
+    def down() -> None:
+        starts.append(1)
+        raise OSError("No route to host")
+
+    manager = PrefillHelperManager(
+        model_path="/models/m",
+        model_type="qwen3_5",
+        adapter=None,
+        language_model=None,
+        attach=lambda session: None,
+        chunk_tokens=1,
+        launcher=SimpleNamespace(),
+    )
+    monkeypatch.setattr(manager, "_start", down)
+
+    def wait_for(predicate):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        raise AssertionError("condition not reached")
+
+    manager.configure("A", None)
+    wait_for(lambda: manager.node_id == "A" and manager._waiting)
+    after_a = len(starts)
+    assert after_a == 1
+
+    manager.configure("B", None)
+    wait_for(
+        lambda: manager.node_id == "B" and manager._waiting and len(starts) > after_a
+    )
+    after_b = len(starts)
+
+    # The stale waiter for A was dropped: its announce must not queue a retry.
+    peers.announce_peer(SimpleNamespace(state="discovered", node_id="A"))
+    time.sleep(0.1)
+    assert len(starts) == after_b
+
+    # B's own announce is the one that wakes this manager.
+    assert peers.online("B", source="discovery") is True
+    wait_for(lambda: len(starts) > after_b)
     manager.close()
 
 
@@ -259,17 +336,40 @@ def test_warm_and_requests_are_kept_per_split():
 
 
 def test_the_gate_is_dated_capacity_with_its_inputs():
-    gate = health.gate(39, {"budget": 98 << 30, "memory": 128 << 30}, 1700000000.0)
+    budgets = [98 << 30]
+    gate = health.gate(
+        39,
+        {"budget": 200 << 30, "memory": 128 << 30},
+        1700000000.0,
+        budgets=budgets,
+        max_layers=48,
+    )
     assert gate["kind"] == "capacity"
-    assert (gate["layers_fit"], gate["max_layers_fit"]) == (39, 39)
+    # The two numbers are distinct: capacity under the split limit, and with
+    # it removed. Neither is a second name for the other (finding 4).
+    assert (gate["layers_fit"], gate["max_layers_fit"]) == (39, 48)
     assert gate["measured_at"] == 1700000000.0
+    # The inputs are the *clamped* budgets the fit used, not the raw report:
+    # an unclamped DGX Spark budget does not reproduce the output.
     assert gate["inputs"] == {
         "available_bytes": 98 << 30,
         "memory_bytes": 128 << 30,
         "source": "helper-info",
     }
+    assert gate["budget"] == 98 << 30
     # No stored measurement with provenance exists, so none is claimed.
     assert "recommended_layers" in gate and gate["recommended_layers"] is None
+
+
+def test_the_gate_inputs_are_the_budgets_the_fit_used():
+    """A DGX Spark reports one budget; the OS reserve clamps it."""
+    from omlx.prefill_helper.manager import helper_budget
+
+    info = {"budgets": [128 << 30], "integrated": True, "memory": 128 << 30}
+    budgets = helper_budget(info)
+    assert budgets[0] < (128 << 30)
+    gate = health.gate(20, info, 1.0, budgets=budgets, max_layers=24)
+    assert gate["inputs"]["available_bytes"] == budgets[0]
 
 
 def test_a_candidate_row_dates_its_figures(monkeypatch):
@@ -290,25 +390,35 @@ def test_a_candidate_row_dates_its_figures(monkeypatch):
         remote_info=lambda target: info,
         incompatible=lambda info, adapter, name, oqh=None: None,
         plan_mismatch=handshake.plan_mismatch,
-        source_mismatch=handshake.source_mismatch,
+        # The host's own commit is resolved at call time; pin it here so the
+        # row is deterministic.
+        source_mismatch=lambda info: handshake.source_mismatch(info, ours="abc123"),
     )
     monkeypatch.setattr(helper_routes, "transport_for", lambda node: transport)
     monkeypatch.setattr(helper_routes, "computer_name", lambda: "this-mac")
     adapter = SimpleNamespace(
         memory_plan=lambda path: (1 << 30, [1 << 30] * 60),
-        split_limit=lambda count: count,
+        # The family's limit binds below what the memory would hold, so the
+        # two capacity figures must differ.
+        split_limit=lambda count: 20,
     )
     device = {"node_id": "n", "friendly_name": "nvidia1", "caps": {}}
+    # The shared record is a manager's to write; this read-only row reports
+    # what it read there and its own probe beside it.
+    peers.online("n")
     row = helper_routes._candidate(device, "/models/m", adapter)
     assert row["online"] is True
     assert row["version_ok"] is True and row["plan_ok"] is True
     assert row["source_mismatch"] is False
     assert row["commit"] == "abc123" and row["plan_api_version"] == 1
-    # Enough layers for one GPU's budget; the old key stays beside the new.
-    assert row["layers_fit"] == row["max_layers_fit"] > 0
+    assert row["layers_fit"] == 20
+    assert row["max_layers_fit"] > row["layers_fit"]
+    assert row["gate"]["layers_fit"] == 20
+    assert row["gate"]["max_layers_fit"] == row["max_layers_fit"]
     assert isinstance(row["measured_at"], float)
     assert row["gate"]["recommended_layers"] is None
     assert row["gate"]["kind"] == "capacity"
+    assert row["probe"] == {"at": row["measured_at"], "ok": True, "reason": None}
     assert row["peer"]["reachable"] is True
 
 
@@ -326,9 +436,54 @@ def test_a_refusal_is_distinguished_from_an_unreachable_mac(monkeypatch):
     device = {"node_id": "n", "friendly_name": "nvidia1", "caps": {}}
     row = helper_routes._candidate(device, "/models/m", None)
     assert row["online"] is False
-    assert peers.state("n").status == "offline"
+    assert row["probe"]["ok"] is False and row["probe"]["reason"]
+    # No measured figures on a row whose probe failed.
+    assert "measured_at" not in row
     peers.refused("n", "does not support this model family yet.")
     assert peers.state("n").to_dict()["refused"] is True
+
+
+def test_a_read_only_probe_does_not_write_the_shared_peer_state(monkeypatch):
+    """``/candidates`` and ``/check`` may not mark a serving manager offline.
+
+    The record is shared by every model armed to the node, so a failed poll
+    would report "unreachable" for a manager that is ready and serving
+    (finding 2, the same class as the bug this module exists to fix).
+    """
+    from omlx.prefill_helper import routes as helper_routes
+
+    peers.online("n")
+    before = peers.state("n")
+
+    def unreachable(node):
+        raise OSError("No route to host")
+
+    monkeypatch.setattr(
+        helper_routes,
+        "transport_for",
+        lambda node: SimpleNamespace(resolve_target=unreachable),
+    )
+    device = {"node_id": "n", "friendly_name": "nvidia1", "caps": {}}
+    row = helper_routes._candidate(device, "/models/m", None)
+    assert row["online"] is False and row["probe"]["ok"] is False
+    after = peers.state("n")
+    assert (after.status, after.last_ok_at, after.last_error) == (
+        before.status,
+        before.last_ok_at,
+        before.last_error,
+    )
+    assert after.status == "online" and after.serving is True
+
+    # A successful probe is also not evidence the daemon serves this model:
+    # only the manager's own connection writes that.
+    peers.reset()
+    monkeypatch.setattr(
+        helper_routes,
+        "transport_for",
+        lambda node: SimpleNamespace(resolve_target=unreachable),
+    )
+    helper_routes._candidate(device, "/models/m", None)
+    assert peers.state("n").status is None
 
 
 # ---------------------------------------------------------------------------
@@ -449,3 +604,94 @@ def test_a_refused_helper_says_refused(monkeypatch):
     payload = client.get("/admin/api/prefill-helper/models/loaded").json()
     assert payload["prefill_path"] == "local"
     assert payload["fallback_reason"] == "refused"
+
+
+def test_an_armed_but_never_loaded_model_is_not_unreachable(monkeypatch):
+    """No manager status means nobody tried, not that the Mac is down."""
+    client = _app(monkeypatch, None, _armed())
+    payload = client.get("/admin/api/prefill-helper/models/idle").json()
+    assert payload["state"] == "unloaded"
+    assert payload["prefill_path"] == "local"
+    assert payload["fallback_reason"] == "not_loaded"
+    assert payload["arming"]["node_id"] == "helper-mac"
+
+
+def test_the_counters_belong_to_the_model_that_reported_them(monkeypatch):
+    health.note(health.HELPER, model="loaded")
+    health.note(health.LOCAL, health.UNARMED, model="other")
+    client = _app(monkeypatch, READY, _armed())
+    payload = client.get("/admin/api/prefill-helper/models/loaded").json()
+    assert payload["counters"] == {"path": {"helper": 1}, "reason": {}}
+    assert health.snapshot("other") == {"path": {"local": 1}, "reason": {"unarmed": 1}}
+
+
+def test_check_reports_a_failed_probe_without_touching_the_peer(monkeypatch):
+    from omlx.prefill_helper import routes as helper_routes
+
+    peers.online("n")
+
+    def unreachable(target, host=None):
+        raise OSError("No route to host")
+
+    transport = SimpleNamespace(
+        VIA="ssh",
+        resolve_target=lambda node: SimpleNamespace(
+            endpoint="10.0.0.2",
+            link="ethernet",
+            speed_mbps=5000,
+            warnings=(),
+            name="nvidia1",
+        ),
+        remote_info=unreachable,
+    )
+    monkeypatch.setattr(helper_routes, "transport_for", lambda node: transport)
+    monkeypatch.setattr(
+        helper_routes,
+        "get_device_registry",
+        lambda: SimpleNamespace(
+            is_paired=lambda node: True, get=lambda node: {"friendly_name": "nvidia1"}
+        ),
+    )
+    monkeypatch.setattr(helper_routes, "forget_host", lambda node: None)
+    payload = helper_routes._check("n")
+    assert payload["probe"]["ok"] is False
+    assert peers.state("n").status == "online"
+
+
+# ---------------------------------------------------------------------------
+# The host side of the handshake resolves its own source (finding 6)
+
+
+def test_the_host_commit_is_resolved_not_assumed_unknown(monkeypatch):
+    import omlx.prefill_helper as helper_pkg
+
+    # The packaging's environment variable wins.
+    monkeypatch.setenv("OMLX_COMMIT", "envcommit")
+    monkeypatch.setattr(helper_pkg, "_built_commit", lambda: "builtcommit")
+    monkeypatch.setattr(helper_pkg, "_installed_commit", lambda: None)
+    assert helper_pkg._resolve_commit() == "envcommit"
+
+    # With no environment variable, the build's own record is used — this is
+    # the skew the launchd job has and the old constant could never see.
+    monkeypatch.delenv("OMLX_COMMIT", raising=False)
+    assert helper_pkg._resolve_commit() == "builtcommit"
+    monkeypatch.setattr(helper_pkg, "_built_commit", lambda: None)
+    monkeypatch.setattr(helper_pkg, "_installed_commit", lambda: "installed")
+    assert helper_pkg._resolve_commit() == "installed"
+
+    # A source checkout's HEAD is a genuine answer, not a guess.
+    monkeypatch.setattr(helper_pkg, "_installed_commit", lambda: None)
+    assert helper_pkg._resolve_commit() != "unknown"
+
+    # "unknown" only when there genuinely is no source to name.
+    monkeypatch.setattr(helper_pkg, "_git_commit", lambda: None)
+    assert helper_pkg._resolve_commit() == "unknown"
+
+
+def test_source_mismatch_reads_the_host_commit_at_call_time(monkeypatch):
+    import omlx.prefill_helper as helper_pkg
+
+    monkeypatch.setattr(helper_pkg, "_COMMIT", None)
+    monkeypatch.setenv("OMLX_COMMIT", "hostcommit123")
+    assert handshake.source_mismatch({"commit": "hostcommit123"}) is None
+    assert "helpercommit" in handshake.source_mismatch({"commit": "helpercommit"})

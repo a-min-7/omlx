@@ -27,12 +27,21 @@ UNARMED = "unarmed"
 HALF_CONFIGURED = "half_configured"
 UNREACHABLE = "unreachable"
 REFUSED = "refused"
+# Armed, but the model has not been loaded, so no manager has tried yet. A
+# model nobody asked to run is not an unreachable Mac.
+NOT_LOADED = "not_loaded"
 
 # The two arming keys, in the order the settings module declares them.
 ARM_KEYS = ("prefill_helper_node_id", "prefill_helper_layers")
 
-_COUNTERS: dict[str, dict[str, int]] = {"path": {}, "reason": {}}
+# Per model: {"path": {...}, "reason": {...}}. A process-wide total in a
+# per-model row would report one model's traffic under another's name.
+_COUNTERS: dict[str, dict[str, dict[str, int]]] = {}
 _LOCK = threading.Lock()
+
+
+def _key(model: Any) -> str:
+    return "" if model is None else str(model)
 
 
 def arming(settings: Any) -> dict[str, Any]:
@@ -65,23 +74,39 @@ def arming(settings: Any) -> dict[str, Any]:
     }
 
 
-def gate(held: int, info: dict[str, Any], measured_at: float) -> dict[str, Any]:
+def gate(
+    held: int,
+    info: dict[str, Any],
+    measured_at: float,
+    *,
+    budgets: list[int],
+    max_layers: int,
+) -> dict[str, Any]:
     """The memory figures, dated and labelled as a capacity, not a target.
 
     #84: ``layers_fit`` is how many layers would still fit; arming to it
-    measured ~40 % slower than a moderate split (k=24 of 39). The numbers are
-    one moment's reading (#86 e): co-tenants moved ``budget`` from 98.3 to
-    21.7 GiB in an afternoon. ``recommended_layers`` stays ``None`` until a
-    stored measurement with provenance exists; no code may invent one.
+    measured ~40 % slower than a moderate split (k=24 of 39), so it is a
+    capacity and never a recommendation. The numbers are one moment's reading
+    (#86 e): co-tenants moved ``budget`` from 98.3 to 21.7 GiB in an
+    afternoon.
+
+    ``max_layers_fit`` is the same fit with the family's split limit removed:
+    it exceeds ``layers_fit`` only when that limit binds, and it is not a
+    second name for the same number. ``inputs.available_bytes`` is the sum of
+    the *clamped* budgets ``fit_layers`` used, so the inputs reproduce the
+    output (an unclamped DGX Spark budget does not).
+
+    ``recommended_layers`` stays ``None`` until a stored measurement with
+    provenance exists; no code may invent one.
     """
     return {
         "kind": "capacity",
         "layers_fit": held,
-        "max_layers_fit": held,
-        "budget": info.get("budget"),
+        "max_layers_fit": int(max_layers),
+        "budget": sum(budgets),
         "measured_at": measured_at,
         "inputs": {
-            "available_bytes": info.get("budget"),
+            "available_bytes": sum(budgets),
             "memory_bytes": info.get("memory"),
             "source": "helper-info",
         },
@@ -89,24 +114,25 @@ def gate(held: int, info: dict[str, Any], measured_at: float) -> dict[str, Any]:
     }
 
 
-def note(path: str, reason: str | None = None) -> None:
-    """Count one request (or one load) that went this way."""
+def note(path: str, reason: str | None = None, *, model: Any = None) -> None:
+    """Count one request (or one load) that went this way, for one model."""
     with _LOCK:
-        paths = _COUNTERS["path"]
+        counts = _COUNTERS.setdefault(_key(model), {"path": {}, "reason": {}})
+        paths = counts["path"]
         paths[path] = paths.get(path, 0) + 1
         if reason is not None:
-            reasons = _COUNTERS["reason"]
+            reasons = counts["reason"]
             reasons[reason] = reasons.get(reason, 0) + 1
 
 
-def snapshot() -> dict[str, dict[str, int]]:
-    """Process-wide counts since the server started."""
+def snapshot(model: Any = None) -> dict[str, dict[str, int]]:
+    """One model's counts since the server started (all models if omitted)."""
     with _LOCK:
-        return {"path": dict(_COUNTERS["path"]), "reason": dict(_COUNTERS["reason"])}
+        counts = _COUNTERS.get(_key(model)) or {"path": {}, "reason": {}}
+        return {"path": dict(counts["path"]), "reason": dict(counts["reason"])}
 
 
 def reset() -> None:
     """The tests' isolation hook."""
     with _LOCK:
-        _COUNTERS["path"].clear()
-        _COUNTERS["reason"].clear()
+        _COUNTERS.clear()

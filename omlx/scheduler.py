@@ -6959,12 +6959,15 @@ class Scheduler:
                 # armed for is not serving. A helper that cannot carry a
                 # drafter's layers is neither: the path is local and the
                 # reason is the model's, so no reason is counted.
+                # Keyed by this scheduler's model: the counters are per model,
+                # so one model's fallbacks cannot appear under another's row.
+                model = self.config.model_name
                 if self._prefill_helper_retry is None:
-                    health.note(health.LOCAL, health.UNARMED)
+                    health.note(health.LOCAL, health.UNARMED, model=model)
                 elif session is None or not session.accepts(len(tokens) - 1):
-                    health.note(health.LOCAL, health.UNREACHABLE)
+                    health.note(health.LOCAL, health.UNREACHABLE, model=model)
                 else:
-                    health.note(health.LOCAL)
+                    health.note(health.LOCAL, model=model)
             return False
         state = self._begin_prefill(request, tokens, cache)
         state.sampler = sampler
@@ -6990,9 +6993,9 @@ class Scheduler:
             )
         if state.helper is None:
             state.alone = session
-            health.note(health.LOCAL)
+            health.note(health.LOCAL, model=self.config.model_name)
         else:
-            health.note(health.HELPER)
+            health.note(health.HELPER, model=self.config.model_name)
         # Without a job the request still prefills here in chunks.
         self.prefilling.append(request)
         self._prefill_states[request.request_id] = state

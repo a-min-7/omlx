@@ -1253,6 +1253,15 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     client = TestClient(app)
     base = "/admin/api/prefill-helper"
     idle = client.get(f"{base}/models/idle").json()
+    # A shape guard, not only per-key checks: an unintended extra key is a
+    # contract change, and five assertions would not notice one.
+    assert set(idle) == {
+        "state",
+        "prefill_path",
+        "fallback_reason",
+        "arming",
+        "counters",
+    }
     assert idle["state"] == "unloaded"
     # #79: an unloaded model still says where its prompts would run.
     assert idle["prefill_path"] == "local"
