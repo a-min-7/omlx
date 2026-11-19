@@ -234,11 +234,11 @@ class PrefillHelperSession:
         helper's own compute and the link's transfer are reported beside it
         and never subtracted from it: the three overlap.
 
-        The per-split ``warm`` is "this same k has served a prompt since the
-        model loaded", not KV-cache state: caches are built per request and
-        nothing is retained between prompts. It marks the split as exercised
-        in this process, so the first row after a changed k is not compared
-        against a warmed one.
+        The per-split ``warm`` is false for this k's *first* request since
+        the model loaded and true from its second on: the first request pays
+        the split's first-use cost, later ones do not. It is not KV-cache
+        state — caches are built per request and nothing is retained between
+        prompts — and it says nothing about a different k, which starts cold.
         """
         with self._lock:
             self._jobs.pop(request_id, None)
@@ -265,9 +265,10 @@ class PrefillHelperSession:
     def split_stats(self) -> dict[str, dict[str, Any]]:
         """{k: {warm, requests_since_load, last_at}} for this session.
 
-        ``warm`` is true once this k has served a prompt since the model
-        loaded — a statement about this process's history with that split,
-        never about a retained KV cache (there is none between prompts).
+        ``warm`` is false on this k's first request since the model loaded
+        and true from its second on — the first pays first-use cost, later
+        ones do not. It is not KV-cache state (there is none between
+        prompts), and a different k starts cold at zero.
         """
         with self._lock:
             return {str(k): dict(value) for k, value in sorted(self._splits.items())}

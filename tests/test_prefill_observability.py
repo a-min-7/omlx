@@ -169,17 +169,18 @@ def test_backoff_reads_as_a_schedule_not_as_a_silent_mac(monkeypatch):
 
     announce = SimpleNamespace(state="discovered", node_id="n")
     peers.announce_peer(announce)
-    # One object serves both surfaces: discovery's sighting flips reachable
-    # while the schedule it interrupted is still visible.
-    assert manager.status()["peer"]["reachable"] is True
+    # The sighting wakes the manager, but it does not rewrite what the last
+    # connection established: reachable stays false and the schedule stays
+    # visible until a connection actually succeeds.
+    peer = manager.status()["peer"]
+    assert peer["reachable"] is False
+    assert peer["serving"] is False
+    assert peer["last_seen_at"] is not None
     deadline = time.time() + 5
     while not starts and time.time() < deadline:
         time.sleep(0.01)
     assert starts == [1]
-    # The Mac's mDNS answer is not the daemon: the retry schedule stays
-    # reported until a connection actually succeeds.
     assert manager.status()["backing_off"] is not None
-    assert manager.status()["peer"]["serving"] is False
     # Every later announce is not another retry.
     peers.announce_peer(announce)
     peers.announce_peer(announce)
@@ -194,13 +195,69 @@ def test_only_a_connected_helper_clears_the_reported_schedule():
     peers.backing_off("n", 2, 30.0)
     peers.announce_peer(SimpleNamespace(state="discovered", node_id="n"))
     state = peers.state("n")
-    assert (state.status, state.attempt) == ("online", 2)
+    # The last authoritative observation was a failure, and the schedule it
+    # produced is still the truth until something connects.
+    assert (state.status, state.attempt) == ("offline", 2)
     assert state.next_retry_at is not None
+    assert state.last_seen_at is not None
     assert state.to_dict()["serving"] is False
     # The manager connected and is serving: now the schedule is gone.
     peers.online("n")
     assert (peers.state("n").attempt, peers.state("n").next_retry_at) == (0, None)
     assert peers.state("n").to_dict()["serving"] is True
+
+
+def test_an_announce_does_not_overwrite_an_authoritative_online():
+    """F1: a sighting must not retract what a connection established.
+
+    The manager calls ``peers.online`` once, on success, and never
+    re-asserts it; if an announce rewrote ``source`` to "discovery", every
+    later row would read as not serving for the rest of the session.
+    """
+    peers.online("n")
+    assert peers.state("n").to_dict()["serving"] is True
+    peers.announce_peer(SimpleNamespace(state="discovered", node_id="n"))
+    state = peers.state("n")
+    # The defect itself: the announce rewrote source to "discovery" and the
+    # serving row went false for the rest of the session.
+    assert state.to_dict()["serving"] is True
+    assert state.status == "online"
+    assert state.source != "discovery"
+
+
+def test_an_announce_does_not_turn_a_refusal_into_an_unreachable_mac():
+    """F1/F5: a refusal stands, and an announce is not an attempt."""
+    peers.refused("n", "does not support this model family yet.")
+    attempted = peers.state("n").last_attempt_at
+    peers.announce_peer(SimpleNamespace(state="discovered", node_id="n"))
+    state = peers.state("n")
+    record = state.to_dict()
+    # The defect itself: the announce cleared the refusal, so the status
+    # surface flipped from fallback_reason=refused to unreachable.
+    assert record["refused"] is True
+    assert record["reachable"] is False
+    assert state.status == "refused"
+    # The announce was not an attempt to reach the daemon.
+    assert state.last_attempt_at == attempted
+    # It was still seen, and the sighting is recorded as exactly that.
+    assert state.last_seen_at is not None
+
+
+def test_an_announce_ends_an_outage_without_claiming_health():
+    """The edge still fires once; the offline status and schedule stand."""
+    calls = []
+    peers.offline("n", "timed out")
+    peers.backing_off("n", 2, 30.0)
+    peers.wait_for("n", lambda: calls.append(1))
+    announce = SimpleNamespace(state="discovered", node_id="n")
+    peers.announce_peer(announce)
+    assert calls == [1]
+    state = peers.state("n")
+    assert (state.status, state.attempt) == ("offline", 2)
+    # The announce storm is not another edge (the waiter list was consumed).
+    peers.announce_peer(announce)
+    peers.announce_peer(announce)
+    assert calls == [1]
 
 
 def test_a_node_change_does_not_lose_the_discovery_wake(monkeypatch):
@@ -465,7 +522,8 @@ def test_a_read_only_probe_does_not_write_the_shared_peer_state(monkeypatch):
     )
     device = {"node_id": "n", "friendly_name": "nvidia1", "caps": {}}
     row = helper_routes._candidate(device, "/models/m", None)
-    assert row["online"] is False and row["probe"]["ok"] is False
+    # Assert on the defect first: on pre-fix code this probe rewrote the
+    # record to offline, and the ``probe`` field did not exist to inspect.
     after = peers.state("n")
     assert (after.status, after.last_ok_at, after.last_error) == (
         before.status,
@@ -473,6 +531,7 @@ def test_a_read_only_probe_does_not_write_the_shared_peer_state(monkeypatch):
         before.last_error,
     )
     assert after.status == "online" and after.serving is True
+    assert row["online"] is False and row["probe"]["ok"] is False
 
     # A successful probe is also not evidence the daemon serves this model:
     # only the manager's own connection writes that.
@@ -599,11 +658,38 @@ def test_a_ready_model_with_no_helper_says_unreachable(monkeypatch):
 
 
 def test_a_refused_helper_says_refused(monkeypatch):
-    status = {**READY, "state": "error", "peer": {"reachable": True, "refused": True}}
+    # A refusal is an answer, and the record says so: not reachable.
+    status = {**READY, "state": "error", "peer": {"reachable": False, "refused": True}}
     client = _app(monkeypatch, status, _armed())
     payload = client.get("/admin/api/prefill-helper/models/loaded").json()
     assert payload["prefill_path"] == "local"
     assert payload["fallback_reason"] == "refused"
+
+
+@pytest.mark.parametrize(
+    "state,reason",
+    [
+        ("needs_files", "needs_files"),
+        ("copying", "copying"),
+        ("starting", "starting"),
+        ("connecting", "starting"),
+        ("stopped", "stopped"),
+    ],
+)
+def test_a_reachable_mac_names_its_own_state_not_unreachable(
+    monkeypatch, state, reason
+):
+    """F2: the Mac answered; only a failed connection is "unreachable".
+
+    The old fallthrough reported every one of these as unreachable, telling
+    a user who deliberately stopped the helper that the Mac does not answer.
+    """
+    status = {**READY, "state": state, "peer": {"reachable": True, "refused": False}}
+    client = _app(monkeypatch, status, _armed())
+    payload = client.get("/admin/api/prefill-helper/models/loaded").json()
+    assert payload["prefill_path"] == "local"
+    assert payload["fallback_reason"] == reason
+    assert payload["fallback_reason"] != "unreachable"
 
 
 def test_an_armed_but_never_loaded_model_is_not_unreachable(monkeypatch):

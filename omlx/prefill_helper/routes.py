@@ -127,9 +127,7 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
             # The helper already runs for this model.
             lending = None
     max_layers = fit_layers(shared, per_layer, budgets, len(per_layer))
-    gate = health.gate(
-        held, info, measured_at, budgets=budgets, max_layers=max_layers
-    )
+    gate = health.gate(held, info, measured_at, budgets=budgets, max_layers=max_layers)
     return {
         **row,
         "online": True,
@@ -344,8 +342,12 @@ def model_health(settings: Any, status: dict | None) -> dict:
     """Where this model's requests go, and why not (#79).
 
     Read from the saved arming and the manager's own state, never from a
-    stale text: an armed model whose helper is not serving says why
-    (``refused`` when the helper answered no, ``unreachable`` otherwise).
+    stale text. The ladder matters: a model that was never loaded is not
+    unreachable, and neither is a Mac that is copying files, starting, or was
+    stopped on purpose — those are its own states. ``refused`` and
+    ``unreachable`` are reserved for a helper that answered no and one whose
+    connection failed; an unknown state on a reachable Mac reports the state
+    rather than inventing a connection failure.
     """
     armed = health.arming(settings)
     state = (status or {}).get("state")
@@ -365,7 +367,25 @@ def model_health(settings: Any, status: dict | None) -> dict:
             "fallback_reason": health.NOT_LOADED,
             "arming": armed,
         }
+    reason = health.STATE_REASONS.get(state)
+    if reason is not None:
+        # The Mac answered. Copying files, starting, or stopped on purpose
+        # are its own states; telling the user it "does not answer" would be
+        # a false cause on the surface built to stop false causes.
+        return {
+            "prefill_path": health.LOCAL,
+            "fallback_reason": reason,
+            "arming": armed,
+        }
     peer = ((status or {}).get("peer")) or {}
+    if peer.get("reachable"):
+        # Reachable but in a state with no named cause: say the state, not a
+        # connection failure that nobody observed.
+        return {
+            "prefill_path": health.LOCAL,
+            "fallback_reason": str(state),
+            "arming": armed,
+        }
     return {
         "prefill_path": health.LOCAL,
         "fallback_reason": (

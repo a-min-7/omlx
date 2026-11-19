@@ -30,6 +30,22 @@ REFUSED = "refused"
 # Armed, but the model has not been loaded, so no manager has tried yet. A
 # model nobody asked to run is not an unreachable Mac.
 NOT_LOADED = "not_loaded"
+# The helper Mac answered; these are its own states, and each names itself.
+# "unreachable" is reserved for a connection that actually failed.
+NEEDS_FILES = "needs_files"
+COPYING = "copying"
+STARTING = "starting"
+STOPPED = "stopped"
+
+# The manager's non-serving states where the Mac is not an unanswered one.
+STATE_REASONS = {
+    "off": STARTING,
+    "connecting": STARTING,
+    "starting": STARTING,
+    "needs_files": NEEDS_FILES,
+    "copying": COPYING,
+    "stopped": STOPPED,
+}
 
 # The two arming keys, in the order the settings module declares them.
 ARM_KEYS = ("prefill_helper_node_id", "prefill_helper_layers")

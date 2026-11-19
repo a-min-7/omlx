@@ -19,9 +19,11 @@ three, and the reason travels with it:
 
 Those two ONLINEs are not equal. An mDNS announce proves the *Mac* is up, not
 that its daemon answers or that it still serves this model, so a discovery
-observation is **non-authoritative**: it wakes the waiter (an offline→online
-edge is worth one immediate retry) but it neither clears the retry schedule
-nor claims ``last_ok_at``. Only a successful connection to the daemon does.
+observation is **non-authoritative** and records only ``last_seen_at``: it
+wakes the waiter (an offline→online edge is worth one immediate retry) but
+never rewrites the status, its source, ``refused`` or the retry schedule. Only
+a successful connection to the daemon may claim health — and it is the only
+thing that can retract a refusal.
 
 A peer that goes from ``OFFLINE``/``REFUSED`` back to ``ONLINE`` wakes exactly
 one waiter, once per edge: an mDNS announce every few seconds must not reset
@@ -111,27 +113,30 @@ def observe(
 
     ``authoritative=False`` is for evidence weaker than a connection to the
     daemon (an mDNS announce). It can end an outage — the edge fires and a
-    retry follows — but it must not clear a retry schedule or claim
-    ``last_ok_at``, because the Mac being up does not mean its helper serves
-    this model.
+    retry follows — but it records only a sighting: the last authoritative
+    status, its source, ``refused`` and the retry schedule all stand. The Mac
+    being up does not mean its helper serves this model, and it must not
+    overwrite what a connection actually established.
     """
     at = _now() if now is None else now
     with _LOCK:
         peer = _STATES.setdefault(node_id, PeerState(node_id))
         before = peer.status
-        peer.status, peer.source, peer.last_attempt_at = status, source, at
-        if status == ONLINE:
-            if authoritative:
+        if authoritative:
+            peer.status, peer.source, peer.last_attempt_at = status, source, at
+            if status == ONLINE:
                 peer.last_ok_at, peer.last_error = at, None
                 peer.attempt, peer.next_retry_at = 0, None
             else:
-                peer.last_seen_at = at
+                peer.last_error = reason
+                if status == REFUSED:
+                    # No automatic retry is scheduled, so nothing wakes the
+                    # manager on its own; the peer is as reachable as it gets.
+                    peer.next_retry_at = None
         else:
-            peer.last_error = reason
-            if status == REFUSED:
-                # No automatic retry is scheduled, so nothing wakes the
-                # manager on its own; the peer is as reachable as it gets.
-                peer.next_retry_at = None
+            # A sighting, not an attempt and not an observation of the
+            # daemon: last_attempt_at stays, and so does everything above.
+            peer.last_seen_at = at
         edge = status == ONLINE and before in (OFFLINE, REFUSED)
         callbacks: list[Callable[[], None]] = _WAITERS.pop(node_id, []) if edge else []
     # Outside the lock: a waiter may start work that observes this peer again.
