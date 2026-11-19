@@ -12,6 +12,7 @@ import asyncio
 import os
 import signal
 import subprocess
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -22,7 +23,7 @@ from fastapi import APIRouter, HTTPException
 from .. import __version__
 from ..cluster.registry import get_device_registry
 from ..oqh import format as oqh_format
-from . import launcher
+from . import health, launcher, peers
 from .adapters import adapter_for_model
 from .lending import active_lending, forget_host, recorded_host
 from .manager import (
@@ -93,20 +94,25 @@ def helper_status(entry: Any) -> dict | None:
 
 def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
     caps = device.get("caps") or {}
+    node_id = device["node_id"]
     row = {
-        "node_id": device["node_id"],
+        "node_id": node_id,
         "name": device["friendly_name"],
         "chip": caps.get("chip"),
         "ram_gb": caps.get("ram_gb"),
     }
-    transport = transport_for(device["node_id"])
+    transport = transport_for(node_id)
     try:
-        target = transport.resolve_target(device["node_id"])
+        target = transport.resolve_target(node_id)
         info = transport.remote_info(target)
     except launcher.LaunchError as error:
-        return {**row, "online": False, "reason": str(error)}
+        peers.offline(node_id, str(error), source="candidates")
+        return current_peer_row(row, node_id, reason=str(error))
     except (OSError, subprocess.SubprocessError, ValueError) as error:
-        return {**row, "online": False, "reason": str(error)}
+        peers.offline(node_id, str(error), source="candidates")
+        return current_peer_row(row, node_id, reason=str(error))
+    peers.online(node_id, source="candidates")
+    measured_at = time.time()
     shared, per_layer = adapter.memory_plan(model_path)
     limit = adapter.split_limit(len(per_layer))
     held = fit_layers(shared, per_layer, helper_budget(info), limit)
@@ -119,6 +125,7 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         if lending == {"host": computer_name(), "model": Path(model_path).name}:
             # The helper already runs for this model.
             lending = None
+    gate = health.gate(held, info, measured_at)
     return {
         **row,
         "online": True,
@@ -129,10 +136,41 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
             info, adapter, row["name"], oqh_format.checkpoint_version(model_path)
         )
         is None,
+        # Distinct from version_ok: the same version can be built from a
+        # different commit, and the memory plan has its own shape version.
+        "commit": info.get("commit"),
+        "plan_api_version": info.get("plan_api_version"),
+        "plan_ok": transport.plan_mismatch(info) is None,
+        "source_mismatch": transport.source_mismatch(info) is not None,
         "layers_fit": held,
+        "max_layers_fit": held,
         "budget": info.get("budget"),
+        "measured_at": measured_at,
+        "gate": gate,
         "on_battery": bool(info.get("on_battery")),
         "lending": lending,
+        "peer": peers.state(node_id).to_dict(),
+    }
+
+
+def current_peer_row(row: dict, node_id: str, *, reason: str) -> dict:
+    """A candidate that did not answer, described by the one peer state."""
+    peer = peers.state(node_id)
+    return {
+        **row,
+        "online": False,
+        "reason": reason,
+        "measured_at": time.time(),
+        "peer": peer.to_dict(),
+        "backing_off": (
+            {
+                "attempt": peer.attempt,
+                "next_retry_at": peer.next_retry_at,
+                "last_error": peer.last_error,
+            }
+            if peer.attempt and peer.next_retry_at is not None
+            else None
+        ),
     }
 
 
@@ -188,8 +226,10 @@ def _check(node_id: str) -> dict:
     try:
         info = transport.remote_info(target, host=this_host())
     except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
+        peers.offline(node_id, str(error), source="check")
         rows.append({"key": "version", "status": "fail", "detail": str(error)})
         return {"node_id": node_id, "name": target.name, "rows": rows}
+    peers.online(node_id, source="check")
     theirs = info.get("link_mbps")
     if theirs and target.speed_mbps and theirs < target.speed_mbps:
         # A helper daemon reports the speed of its own end; the slower end
@@ -210,6 +250,20 @@ def _check(node_id: str) -> dict:
     else:
         version["expected"] = __version__
     rows.append(version)
+    plan_problem = transport.plan_mismatch(info)
+    source_problem = transport.source_mismatch(info)
+    if info.get("commit") or info.get("plan_api_version") is not None:
+        # Its own row: a helper can pass the contract check and still be
+        # built from another commit, or plan memory with another shape.
+        rows.append(
+            {
+                "key": "source",
+                "status": "warn" if (plan_problem or source_problem) else "pass",
+                "detail": info.get("commit") or "unknown",
+                "plan_api_version": info.get("plan_api_version"),
+                "fix": plan_problem or source_problem or "",
+            }
+        )
     budgets = helper_budget(info)
     memory = {"key": "memory", "status": "pass", "bytes": sum(budgets)}
     if "budgets" in info:
@@ -256,9 +310,41 @@ async def delete_copy(node_id: str, name: str) -> dict:
     )
 
 
+def model_health(settings: Any, status: dict | None) -> dict:
+    """Where this model's requests go, and why not (#79).
+
+    Read from the saved arming and the manager's own state, never from a
+    stale text: an armed model whose helper is not serving says why
+    (``refused`` when the helper answered no, ``unreachable`` otherwise).
+    """
+    armed = health.arming(settings)
+    state = (status or {}).get("state")
+    if armed["path"] == health.HELPER and state in ("ready", "working"):
+        return {"prefill_path": health.HELPER, "fallback_reason": None, "arming": armed}
+    if armed["path"] == health.LOCAL:
+        return {
+            "prefill_path": health.LOCAL,
+            "fallback_reason": armed["reason"],
+            "arming": armed,
+        }
+    peer = ((status or {}).get("peer")) or {}
+    return {
+        "prefill_path": health.LOCAL,
+        "fallback_reason": (
+            health.REFUSED if peer.get("refused") else health.UNREACHABLE
+        ),
+        "arming": armed,
+    }
+
+
 @router.get("/models/{model_id}")
 async def model_status(model_id: str) -> dict:
-    return helper_status(_entry(model_id)) or {"state": "unloaded"}
+    entry = _entry(model_id)
+    status = helper_status(entry)
+    payload: dict[str, Any] = dict(status) if status else {"state": "unloaded"}
+    payload.update(model_health(_saved_settings(model_id), status))
+    payload["counters"] = health.snapshot()
+    return payload
 
 
 @router.post("/models/{model_id}/{action}")

@@ -14,7 +14,16 @@ import threading
 from contextlib import suppress
 from typing import Any
 
-from . import CONTROL_VERSION, DATA_PROTOCOL, __version__, checkpoint, gpus, wire
+from . import (
+    COMMIT,
+    CONTROL_VERSION,
+    DATA_PROTOCOL,
+    PLAN_API_VERSION,
+    __version__,
+    checkpoint,
+    gpus,
+    wire,
+)
 from .files import FileError, ModelStore
 from .state import State
 
@@ -162,6 +171,8 @@ class ControlServer:
                 "data_protocol": DATA_PROTOCOL,
                 "contracts": self.contracts,
                 "oqh": self.oqh,
+                "commit": COMMIT,
+                "plan_api_version": PLAN_API_VERSION,
                 "gpus": gpus.gpus(self.gpu_indices),
                 "ram": total,
                 "ram_available": available,

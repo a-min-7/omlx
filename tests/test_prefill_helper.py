@@ -1252,7 +1252,19 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     app.include_router(helper_routes.router)
     client = TestClient(app)
     base = "/admin/api/prefill-helper"
-    assert client.get(f"{base}/models/idle").json() == {"state": "unloaded"}
+    idle = client.get(f"{base}/models/idle").json()
+    assert idle["state"] == "unloaded"
+    # #79: an unloaded model still says where its prompts would run.
+    assert idle["prefill_path"] == "local"
+    assert idle["fallback_reason"] == "unarmed"
+    assert idle["arming"] == {
+        "path": "local",
+        "reason": "unarmed",
+        "node_id": None,
+        "layers": None,
+        "automatic_layers": False,
+    }
+    assert isinstance(idle["counters"], dict)
     assert client.get(f"{base}/models/loaded").json()["state"] == "needs_files"
     assert client.post(f"{base}/models/loaded/copy").status_code == 200
     assert client.post(f"{base}/models/idle/copy").status_code == 409
@@ -1650,6 +1662,8 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch):
         resolve_target=lambda node: target,
         remote_info=lambda target, host=None: info,
         incompatible=agent.incompatible,
+        plan_mismatch=agent.plan_mismatch,
+        source_mismatch=agent.source_mismatch,
     )
     monkeypatch.setattr(helper_routes, "transport_for", lambda node: daemon)
     rows = helper_routes._check("n")["rows"]

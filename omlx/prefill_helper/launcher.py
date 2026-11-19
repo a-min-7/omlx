@@ -39,6 +39,7 @@ from ..cluster.transport import (
     shared_link_addresses,
 )
 from .adapter import StageAdapter
+from .handshake import plan_mismatch, source_mismatch  # noqa: F401 - routes re-exports
 from .worker import READY_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -237,9 +238,15 @@ def remote_info(
     )
     lines = result.stdout.strip().splitlines() if result.returncode == 0 else []
     try:
-        return json.loads(lines[-1])
+        info = json.loads(lines[-1])
     except (IndexError, ValueError):
         raise LaunchError(f"oMLX is not installed on {target.name}.") from None
+    # A newer helper reports these; an older one omits them, and an absent
+    # value is not a mismatch. This Mac runs its own oMLX, so ``incompatible``
+    # already requires equal versions.
+    info.setdefault("commit", None)
+    info.setdefault("plan_api_version", None)
+    return info
 
 
 def incompatible(

@@ -87,6 +87,7 @@ from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
 )
+from .prefill_helper import health
 from .prefill_helper.adapter import Capture
 from .prefill_helper.client import HelperError
 from .prefill_helper.session import MIN_TOKENS, HelperPrefill, PrefillHelperSession
@@ -6948,11 +6949,22 @@ class Scheduler:
             # A helper back after a sleep can wait minutes in backoff.
             self._prefill_helper_retry()
         drafter = _block_drafter_for(self.model)
-        if (
-            session is None
-            or (drafter is not None and not session.adapter.captures_layers)
-            or not session.accepts(len(tokens) - 1)
-        ):
+        usable = session is not None and (
+            drafter is None or session.adapter.captures_layers
+        )
+        if not usable or not session.accepts(len(tokens) - 1):
+            if len(tokens) - 1 >= MIN_TOKENS:
+                # #79: count what did not use the helper, and why. Without a
+                # manager the model is unarmed; with one, the helper it is
+                # armed for is not serving. A helper that cannot carry a
+                # drafter's layers is neither: the path is local and the
+                # reason is the model's, so no reason is counted.
+                if self._prefill_helper_retry is None:
+                    health.note(health.LOCAL, health.UNARMED)
+                elif session is None or not session.accepts(len(tokens) - 1):
+                    health.note(health.LOCAL, health.UNREACHABLE)
+                else:
+                    health.note(health.LOCAL)
             return False
         state = self._begin_prefill(request, tokens, cache)
         state.sampler = sampler
@@ -6978,6 +6990,9 @@ class Scheduler:
             )
         if state.helper is None:
             state.alone = session
+            health.note(health.LOCAL)
+        else:
+            health.note(health.HELPER)
         # Without a job the request still prefills here in chunks.
         self.prefilling.append(request)
         self._prefill_states[request.request_id] = state
@@ -7181,6 +7196,10 @@ class Scheduler:
             layers_done - began,
             extra_s=time.perf_counter() - layers_done,
         )
+        # The helper's own duration for this chunk, and the running transfer
+        # total the client measures on arrival. Both are one machine's clock.
+        helper.helper_seconds += part.seconds
+        helper.transfer_seconds = helper.job.transfer_seconds
 
     def _next_prefill_chunk_len(self, state: _PrefillState, n: int) -> int:
         remaining = state.tokens_remaining.shape[1]
@@ -8015,7 +8034,14 @@ class Scheduler:
         self._prefill_states.pop(rid, None)
         seconds = time.monotonic() - (request.prefill_started_at or time.monotonic())
         if state.helper is not None:
-            state.helper.session.finish(rid, state.tokens_processed, seconds)
+            state.helper.session.finish(
+                rid,
+                state.tokens_processed,
+                seconds,
+                layers=state.helper.layers,
+                helper_seconds=state.helper.helper_seconds,
+                transfer_seconds=state.helper.transfer_seconds,
+            )
             # A requeued insert must not wait on the finished job.
             state.helper = None
         elif state.alone is not None:
