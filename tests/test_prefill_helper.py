@@ -1224,6 +1224,27 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     a8.close()
 
 
+def test_rearm_restarts_a_helper_whose_choice_did_not_change(tmp_path):
+    """#86 c: configure() skips an identical (node, layers, a8) on purpose.
+
+    The explicit rearm is what recovers a wedged helper; a save of the same
+    configuration must stay a no-op.
+    """
+    attached, speeds = [], tmp_path / "speeds.json"
+    fake = _FakeLauncher(None)
+    manager = _manager(fake, attached, speeds)
+    manager.configure("node-1", None)
+    _wait_state(manager, "ready")
+    launched = len(fake.servers)
+
+    manager.rearm()
+    _wait_until(
+        lambda: len(fake.servers) > launched, "rearm did not start a new helper"
+    )
+    _wait_state(manager, "ready")
+    manager.close()
+
+
 # ---------------------------------------------------------------------------
 # Admin routes.
 # ---------------------------------------------------------------------------
@@ -1236,6 +1257,7 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
         copy_files=lambda: calls.append("copy"),
         retry=lambda: calls.append("retry"),
         stop=lambda: calls.append("stop"),
+        rearm=lambda: calls.append("rearm"),
     )
     entries = {
         "loaded": SimpleNamespace(engine=SimpleNamespace(prefill_helper=manager)),
@@ -1277,10 +1299,17 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     assert client.get(f"{base}/models/loaded").json()["state"] == "needs_files"
     assert client.post(f"{base}/models/loaded/copy").status_code == 200
     assert client.post(f"{base}/models/idle/copy").status_code == 409
-    # Without a saved helper there is nothing to check.
-    assert client.post(f"{base}/models/idle/check").json() == {"state": "unloaded"}
+    # Without a saved helper there is nothing to check, but the response is
+    # still the one payload with its model_health fields (#91).
+    idle_check = client.post(f"{base}/models/idle/check").json()
+    assert idle_check["state"] == "unloaded"
+    assert idle_check["fallback_reason"] == "unarmed"
+    # An explicit re-arm restarts the helper even when nothing changed
+    # (#86 c); an unloaded model has no manager to restart.
+    assert client.post(f"{base}/models/loaded/rearm").status_code == 200
+    assert client.post(f"{base}/models/idle/rearm").status_code == 409
     assert client.post(f"{base}/models/loaded/reboot").status_code == 404
-    assert calls == ["copy"]
+    assert calls == ["copy", "rearm"]
 
     marker = tmp_path / "active.json"
     monkeypatch.setattr(lending, "active_marker_path", lambda: marker)

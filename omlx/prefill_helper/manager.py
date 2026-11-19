@@ -585,6 +585,18 @@ class PrefillHelperManager:
             peers.clear_backoff(self.node_id)
         self._commands.put(("retry",))
 
+    def rearm(self) -> None:
+        """Restart the helper even when the saved arming did not change.
+
+        ``configure`` deliberately skips an identical (node, layers, a8), so
+        on its own it cannot recover a wedged helper. This is the explicit
+        restart the settings PUT no longer silently pretends to do (#86 c).
+        """
+        if self.node_id is not None:
+            self._stop_waiting()
+            peers.clear_backoff(self.node_id)
+        self._commands.put(("rearm",))
+
     def retry_if_offline(self) -> None:
         """Only when offline: any queued command cancels a copy waiting for the user."""
         with self._lock:
@@ -685,6 +697,11 @@ class PrefillHelperManager:
                 self._set("stopped", node_id=self.node_id)
                 continue
             elif kind == "retry":
+                wanted, attempt = self.node_id is not None, 0
+            elif kind == "rearm":
+                # Drop the running helper first: a restart is the point, and
+                # a live session would otherwise be kept as-is.
+                self._teardown()
                 wanted, attempt = self.node_id is not None, 0
             if not wanted:
                 continue

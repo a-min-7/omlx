@@ -514,6 +514,7 @@
   "settings.global.restart_notice": "Параметры, помеченные",
   "settings.global.restart_badge": "Требует перезапуска",
   "settings.global.restart_suffix": "требуют перезапуска сервера.",
+  "settings.global.restart_required_banner": "Saved. Restart required for: {keys}.",
   "settings.integrations.section_label": "Интеграции",
   "settings.integrations.heading": "Настройки интеграций",
   "settings.integrations.description": "Настройте предварительную обработку документов и интеграции с внешними инструментами.",

@@ -514,6 +514,7 @@
   "settings.global.restart_notice": "Einstellungen mit der Markierung",
   "settings.global.restart_badge": "Neustart",
   "settings.global.restart_suffix": "erfordern einen Serverneustart.",
+  "settings.global.restart_required_banner": "Saved. Restart required for: {keys}.",
   "settings.integrations.section_label": "Integrationen",
   "settings.integrations.heading": "Integrationseinstellungen",
   "settings.integrations.description": "Vorverarbeitung von Dokumenten und Integrationen externer Werkzeuge konfigurieren.",

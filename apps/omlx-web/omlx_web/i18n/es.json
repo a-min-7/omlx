@@ -514,6 +514,7 @@
   "settings.global.restart_notice": "Configuraciones marcadas con",
   "settings.global.restart_badge": "Reiniciar",
   "settings.global.restart_suffix": "requieren reinicio del servidor.",
+  "settings.global.restart_required_banner": "Saved. Restart required for: {keys}.",
   "settings.integrations.section_label": "Integrations",
   "settings.integrations.heading": "Integration Settings",
   "settings.integrations.description": "Configure document preprocessing and external tool integrations.",

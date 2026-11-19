@@ -514,6 +514,7 @@
   "settings.global.restart_notice": "標有",
   "settings.global.restart_badge": "重新啟動",
   "settings.global.restart_suffix": "的設定需要重新啟動伺服器。",
+  "settings.global.restart_required_banner": "Saved. Restart required for: {keys}.",
   "settings.integrations.section_label": "整合",
   "settings.integrations.heading": "整合設定",
   "settings.integrations.description": "設定文件預處理與外部工具整合。",
