@@ -5095,6 +5095,9 @@ _RUNTIME_FIELD_PREFIXES = (
     ("integrations_", "integrations"),
     ("markitdown_", "integrations"),
     ("web_search_", "integrations"),
+    # The handler sets integrations_changed for every splash field too, so
+    # they are covered by the same label.
+    ("splash_", "integrations"),
 )
 # A request flag that is a side effect, not a saved setting.
 _NON_SETTING_FIELDS = {"restart_desktop"}
@@ -5112,51 +5115,118 @@ def _runtime_label(field: str) -> str:
 
 _MISSING = object()
 
-# The values of every field that is never applied at runtime, read before the
-# request mutates the settings. The dashboard sends the whole form on every
-# save, so the pending set must be "value differs", not "field present" —
-# otherwise every save would demand a restart for host, port and the cache
-# directory.
-_RESTART_VALUE_GETTERS = {
-    "host": lambda s: getattr(s.server, "host", _MISSING),
-    "port": lambda s: getattr(s.server, "port", _MISSING),
-    "distributed_inference_enabled": lambda s: getattr(
-        s.server, "distributed_inference_enabled", _MISSING
-    ),
-    "model_dir": lambda s: getattr(s.model, "model_dir", _MISSING),
-    "ssd_cache_dir": lambda s: getattr(s.cache, "ssd_cache_dir", _MISSING),
-    "ssd_cache_max_size": lambda s: getattr(s.cache, "ssd_cache_max_size", _MISSING),
-    "hot_cache_only": lambda s: getattr(s.cache, "hot_cache_only", _MISSING),
-    "hot_cache_write_through": lambda s: getattr(
-        s.cache, "hot_cache_write_through", _MISSING
-    ),
-    "ane_compile_cache": lambda s: getattr(s.cache, "ane_compile_cache", _MISSING),
-    "gdn_snapshot_storage": lambda s: s.cache.get_gdn_snapshot_storage(),
-    "gdn_ssd_split_enabled": lambda s: getattr(
-        s.cache, "gdn_ssd_split_enabled", _MISSING
-    ),
-    "gdn_ssd_pending_max_size": lambda s: getattr(
-        s.cache, "gdn_ssd_pending_max_size", _MISSING
-    ),
-    "gdn_sidecar_precision": lambda s: getattr(
-        s.cache, "gdn_sidecar_state_dtype", _MISSING
-    ),
-    "initial_cache_blocks": lambda s: getattr(
-        s.cache, "initial_cache_blocks", _MISSING
-    ),
-    "mcp_config": lambda s: getattr(s.mcp, "config_path", _MISSING),
+# Request field -> (settings group, attribute), for the fields whose name
+# differs from the one the handler reads. Every other field is found by its
+# own name in one of the groups below; grouped names strip their prefix.
+_FIELD_ALIASES = {
+    "memory_prefill_memory_guard": ("memory", "prefill_memory_guard"),
+    "decode_fairness": ("scheduler", "decode_fairness"),
+    "cache_enabled": ("cache", "enabled"),
+    "gdn_snapshot_storage": ("cache", "get_gdn_snapshot_storage"),
+    "gdn_sidecar_precision": ("cache", "gdn_sidecar_state_dtype"),
+    "mcp_config": ("mcp", "config_path"),
+    "mcp_expose_tools": ("mcp", "expose_tools"),
+    "hf_endpoint": ("huggingface", "endpoint"),
+    "ms_endpoint": ("modelscope", "endpoint"),
+    "ui_language": ("ui", "language"),
+    "ui_dashboard_layout": ("ui", "dashboard_layout"),
+    "ui_custom_theme": ("ui", "custom_theme"),
 }
+_FIELD_PREFIXES = (
+    ("network_", "network", True),
+    ("sampling_", "sampling", True),
+    ("claude_code_", "claude_code", True),
+    ("integrations_", "integrations", True),
+)
+# Tried in order for an un-prefixed field; the first group that has the
+# attribute is the one the handler reads.
+_FIELD_GROUPS = (
+    "server",
+    "model",
+    "memory",
+    "scheduler",
+    "cache",
+    "mcp",
+    "usage",
+    "huggingface",
+    "modelscope",
+    "network",
+    "sampling",
+    "auth",
+    "claude_code",
+    "integrations",
+    "ui",
+    "idle_timeout",
+)
+
+
+def _previous_value(global_settings: Any, field: str) -> Any:
+    """One request field's value before the request mutates the settings.
+
+    The dashboard posts the whole form on every save, so a field whose runtime
+    label is absent is only pending if its *value* changed. This resolves the
+    saved value the same way the GET renders it, where the two differ.
+    """
+    if field in _NON_SETTING_FIELDS:
+        return _MISSING
+    if field == "model_dirs":
+        # The GET and the dashboard render the configured defaults.
+        try:
+            return [
+                str(d)
+                for d in global_settings.model.get_model_dirs(
+                    global_settings.base_path
+                )
+            ]
+        except Exception:
+            return _MISSING
+    if field == "ssd_cache_dir":
+        # The GET renders `ssd_cache_dir or base_path/"cache"`; compare with
+        # that, not the raw None the saved settings hold.
+        try:
+            raw = global_settings.cache.ssd_cache_dir
+            if raw:
+                return raw
+            cache_dir = global_settings.cache.get_ssd_cache_dir(
+                global_settings.base_path
+            )
+            return str(cache_dir)
+        except Exception:
+            return _MISSING
+
+    target = _FIELD_ALIASES.get(field)
+    if target is None:
+        for prefix, group, strip in _FIELD_PREFIXES:
+            if field.startswith(prefix):
+                target = (group, field[len(prefix):] if strip else field)
+                break
+    if target is None:
+        for group in _FIELD_GROUPS:
+            section = getattr(global_settings, group, None)
+            if section is not None and hasattr(section, field):
+                target = (group, field)
+                break
+    if target is None:
+        return _MISSING
+
+    section = getattr(global_settings, target[0], None)
+    if section is None:
+        return _MISSING
+    value = getattr(section, target[1], _MISSING)
+    if callable(value):
+        try:
+            return value()
+        except Exception:
+            return _MISSING
+    return value
 
 
 def _restart_values(global_settings: Any) -> dict[str, Any]:
-    """Snapshot the restart-only fields before a request mutates them."""
-    values = {}
-    for field, getter in _RESTART_VALUE_GETTERS.items():
-        try:
-            values[field] = getter(global_settings)
-        except Exception:  # a stand-in object in a test, or a missing group
-            values[field] = _MISSING
-    return values
+    """Snapshot every field the pending comparison can consult."""
+    return {
+        field: _previous_value(global_settings, field)
+        for field in GlobalSettingsRequest.model_fields
+    }
 
 
 def _same_restart_value(field: str, old: Any, new: Any) -> bool:
@@ -5170,8 +5240,8 @@ def _same_restart_value(field: str, old: Any, new: Any) -> bool:
         return norm(old) == norm(new)
     if field == "gdn_sidecar_precision":
         return str(old).lower() == str(new).lower()
-    if field == "ssd_cache_dir":
-        return str(old or "") == str(new or "")
+    if field in ("ssd_cache_dir", "splash_path"):
+        return str(old or "").strip() == str(new or "").strip()
     return old == new
 
 
