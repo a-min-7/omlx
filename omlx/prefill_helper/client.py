@@ -58,6 +58,9 @@ class HelperJob:
         self._taken = threading.Condition()
         self.acked = -1
         self.finished = False
+        # Seconds this Mac spent receiving the job's chunk frames, measured
+        # here on one clock: the link's share of the prompt, not the helper's.
+        self.transfer_seconds = 0.0
 
     def ready(self) -> bool:
         """True when the next chunk (or an error) is waiting."""
@@ -234,8 +237,15 @@ class HelperClient:
                 meta, specs = wire.recv_header(self.sock)
                 began = time.perf_counter()
                 arrays = wire.recv_arrays(self.sock, specs)
+                seconds = time.perf_counter() - began
                 if meta.get("op") == "chunk":
-                    self._measure(meta, arrays, time.perf_counter() - began)
+                    self._measure(meta, arrays, seconds)
+                    # The link's share of this job, measured on this Mac's
+                    # clock; the helper's own seconds stay a separate figure.
+                    with self._lock:
+                        job = self._jobs.get(meta.get("job_id", ""))
+                    if job is not None:
+                        job.transfer_seconds += seconds
                 self.heard = time.monotonic()
                 if meta.get("op") == "stopped":
                     self.stopped_by_helper = True

@@ -222,11 +222,18 @@ def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
         state.node_id, "nvidia1", "127.0.0.1", "ethernet", control.port, key
     )
     try:
+        # The source commit and the plan shape travel beside the version; a
+        # contract check cannot see either difference.
+        monkeypatch.setattr("omlx_cuda_helper.control.COMMIT", "0123456789abcdef")
+        monkeypatch.setattr("omlx_cuda_helper.control.PLAN_API_VERSION", 2)
         info = agent.remote_info(target)
         assert info["budgets"] == [48 << 30, 48 << 30]
         assert info["contracts"] == {"fake": 7} and info["lending"] is None
         assert info["device"] == "2x NVIDIA RTX A6000"
         assert info["links"] == [cable]
+        assert info["commit"] == "0123456789abcdef"
+        assert info["plan_api_version"] == 2
+        assert agent.plan_mismatch(info) is not None
 
         # Files cross in chunks and appear only when complete.
         model = root / "Model"

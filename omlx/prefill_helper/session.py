@@ -48,6 +48,11 @@ class HelperPrefill:
     capture: tuple[list[int], int] | None = None
     index: int = 0
     chunk: Chunk | None = None
+    # Seconds the helper itself reported for this job's chunks, and the
+    # seconds this Mac spent receiving them. Both denominators are one
+    # clock's duration; no wall-clock timestamp crosses the two Macs.
+    helper_seconds: float = 0.0
+    transfer_seconds: float = 0.0
 
     def next_size(self) -> int:
         return self.grid[self.index] if self.index < len(self.grid) else 0
@@ -79,6 +84,10 @@ class PrefillHelperSession:
     alone_ratio: float | None = None
     _jobs: dict[str, HelperJob] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    # Per split k: how many prompts it has served since this session's load,
+    # and whether its next one is warm. A different k is a different split,
+    # so it starts cold and at zero (#86 b).
+    _splits: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         hello = self.client.info
@@ -208,14 +217,61 @@ class PrefillHelperSession:
             self._jobs[request_id] = job
         return HelperPrefill(self, job, list(grid), layers, capture)
 
-    def finish(self, request_id: str, tokens: int, seconds: float) -> None:
+    def finish(
+        self,
+        request_id: str,
+        tokens: int,
+        seconds: float,
+        *,
+        layers: int | None = None,
+        helper_seconds: float | None = None,
+        transfer_seconds: float | None = None,
+    ) -> None:
+        """Record a helper-served prompt.
+
+        ``seconds`` is this Mac's span from the request's first prefill to its
+        insertion — the client-observed prefill, not the helper's share. The
+        helper's own compute and the link's transfer are reported beside it
+        and never subtracted from it: the three overlap.
+
+        The per-split ``warm`` is false for this k's *first* request since
+        the model loaded and true from its second on: the first request pays
+        the split's first-use cost, later ones do not. It is not KV-cache
+        state — caches are built per request and nothing is retained between
+        prompts — and it says nothing about a different k, which starts cold.
+        """
         with self._lock:
             self._jobs.pop(request_id, None)
+            if layers is not None:
+                split = self._splits.setdefault(
+                    int(layers),
+                    {"warm": False, "requests_since_load": 0, "last_at": None},
+                )
+                split["requests_since_load"] += 1
+                split["warm"] = split["requests_since_load"] > 1
+                split["last_at"] = time.time()
         self.last_prompt = {
             "tokens": tokens,
+            # Kept for one release: the web app's dashboard and the Mac app
+            # read "seconds".
             "seconds": seconds,
+            "session_prefill_seconds": seconds,
+            "helper_seconds": helper_seconds,
+            "transfer_seconds": transfer_seconds,
+            "layers": layers,
             "at": time.time(),
         }
+
+    def split_stats(self) -> dict[str, dict[str, Any]]:
+        """{k: {warm, requests_since_load, last_at}} for this session.
+
+        ``warm`` is false on this k's first request since the model loaded
+        and true from its second on — the first pays first-use cost, later
+        ones do not. It is not KV-cache state (there is none between
+        prompts), and a different k starts cold at zero.
+        """
+        with self._lock:
+            return {str(k): dict(value) for k, value in sorted(self._splits.items())}
 
     def drop(self, request_id: str, reason: str) -> None:
         with self._lock:

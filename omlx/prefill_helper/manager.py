@@ -32,7 +32,7 @@ from ..cluster.pairing import get_pairing_manager
 from ..cluster.registry import default_devices_path
 from ..exceptions import is_metal_out_of_memory
 from ..oqh import format as oqh_format
-from . import agent
+from . import agent, health, peers
 from . import launcher as default_launcher
 from .adapter import StageAdapter
 from .client import HelperClient
@@ -557,6 +557,9 @@ class PrefillHelperManager:
         self._session: PrefillHelperSession | None = None
         self._copy_ok = threading.Event()
         self._lock = threading.Lock()
+        # Whether this manager is waiting for the peer to come back; one
+        # waiter per outage, so a repeated announce cannot reset the backoff.
+        self._waiting = False
         self._thread = threading.Thread(
             target=self._run, name="omlx-prefill-helper", daemon=True
         )
@@ -576,6 +579,10 @@ class PrefillHelperManager:
         self._copy_ok.set()
 
     def retry(self) -> None:
+        if self.node_id is not None:
+            # The user asked; the schedule starts over with their attempt.
+            self._stop_waiting()
+            peers.clear_backoff(self.node_id)
         self._commands.put(("retry",))
 
     def retry_if_offline(self) -> None:
@@ -605,11 +612,29 @@ class PrefillHelperManager:
         if session is not None and status.get("state") == "ready":
             status["layers"] = session.pick_layers()
             status["last_prompt"] = session.last_prompt
+            status["splits"] = session.split_stats()
             # A prompt went past the helper's memory and ran on this Mac.
             status["out_of_memory"] = session.client.out_of_memory
             if session.client.job_count():
                 status["state"] = "working"
+        self._report_peer(status)
         return status
+
+    def _report_peer(self, status: dict[str, Any]) -> None:
+        """Add the one peer record and the retry schedule to a status."""
+        if self.node_id is None:
+            return
+        peer = peers.state(self.node_id)
+        status["peer"] = peer.to_dict()
+        if peer.attempt and peer.next_retry_at is not None:
+            # A scheduled retry is not an unanswered Mac: say which it is.
+            status["backing_off"] = {
+                "attempt": peer.attempt,
+                "next_retry_at": peer.next_retry_at,
+                "last_error": peer.last_error,
+            }
+        else:
+            status["backing_off"] = None
 
     # -- worker thread ---------------------------------------------------------
 
@@ -690,18 +715,51 @@ class PrefillHelperManager:
                     )
                 else:
                     attempt = 1
-                    self._set("offline", reason=reason)
+                    self._backing_off(attempt, reason)
                 continue
             try:
                 self._start()
                 attempt = 0
             except _PermanentError as error:
                 wanted = False
+                # The helper answered and said no; a retry cannot fix it.
+                self._stop_waiting()
+                if self.node_id is not None:
+                    peers.refused(self.node_id, str(error))
                 self._set("error", reason=str(error))
             except Exception as error:  # network, SSH, helper crash
                 logger.warning("Prefill helper did not start: %s", error)
                 attempt += 1
-                self._set("offline", reason=str(error))
+                self._backing_off(attempt, str(error))
+
+    def _backing_off(self, attempt: int, reason: str) -> None:
+        """Offline with a retry scheduled, recorded in the one peer state.
+
+        The peer is not asked again until the delay ends, so a status that
+        still says "does not answer" would name a cause nobody has observed
+        since the failure. ``status()`` carries the schedule beside it.
+        """
+        self._set("offline", reason=reason)
+        if self.node_id is None:
+            return
+        peers.offline(self.node_id, reason)
+        delay = _RETRY_DELAYS_S[min(attempt - 1, len(_RETRY_DELAYS_S) - 1)]
+        peers.backing_off(self.node_id, attempt, delay)
+        if not self._waiting:
+            # One waiter per outage: discovery may announce the Mac many
+            # times, and only its return from offline may reset the backoff.
+            self._waiting = True
+            peers.wait_for(self.node_id, self._peer_returned)
+
+    def _peer_returned(self) -> None:
+        """Discovery saw the Mac come back: one immediate retry."""
+        self._waiting = False
+        self._commands.put(("retry",))
+
+    def _stop_waiting(self) -> None:
+        if self._waiting and self.node_id is not None:
+            peers.stop_waiting(self.node_id, self._peer_returned)
+        self._waiting = False
 
     def _report(self, state: str, **fields: Any) -> None:
         self._set(state, node_id=self.node_id, **fields)
@@ -774,6 +832,26 @@ class PrefillHelperManager:
         )
         self._saved = tuple(saved.get(k) for k in ("helper", "host", "extra", "alone"))
         self.attach(self._session)
+        if self.node_id is not None:
+            peers.online(self.node_id)
+        problem = agent.plan_mismatch(info) or agent.source_mismatch(info)
+        logger.info(
+            "Prefill helper %s: version=%s commit=%s plan_api_version=%s layers=%d",
+            self.node_id,
+            info.get("version"),
+            info.get("commit") or "unknown",
+            info.get("plan_api_version"),
+            held,
+        )
+        if problem is not None:
+            # The contract check passed, so this is the only place a source
+            # or plan difference is visible.
+            logger.warning("Prefill helper %s: %s", self.node_id, problem)
+        # The capacity the gate reports is the one ``held`` was computed
+        # from: the clamped budgets, with the split limit removed for the
+        # second figure. Neither is a recommendation.
+        budgets = helper_budget(info)
+        shared, per_layer = self.adapter.memory_plan(self.model_path)
         self._set(
             "ready",
             node_id=self.node_id,
@@ -781,6 +859,14 @@ class PrefillHelperManager:
             device=info.get("device"),
             memory=info.get("memory"),
             on_battery=bool(info.get("on_battery")),
+            plan_problem=problem,
+            gate=health.gate(
+                held,
+                info,
+                time.time(),
+                budgets=budgets,
+                max_layers=fit_layers(shared, per_layer, budgets, len(per_layer)),
+            ),
         )
 
     def _ask(self, **fields: Any) -> None:
@@ -866,6 +952,10 @@ class PrefillHelperManager:
         self._saved = speeds
 
     def _teardown(self) -> None:
+        # Whatever peer this manager waited on is no longer the armed one:
+        # a configure to another node would otherwise see a stale guard and
+        # never register a waiter for the new peer (the wake is then lost).
+        self._stop_waiting()
         if self._session is not None:
             self._save_speeds()
             self.attach(None)

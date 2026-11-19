@@ -23,7 +23,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from .cluster.deployment import ClusterDeployment
@@ -88,6 +88,7 @@ from .patches.inkling2.dspark import (
 )
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
+from .prefill_helper import health as prefill_health
 from .prefill_helper.adapters import adapter_for_model as prefill_stage_adapter
 from .prefill_helper.lending import lending_note
 from .prefill_helper.manager import prepare as prepare_prefill_helper
@@ -2418,13 +2419,72 @@ class EnginePool:
                 logger.debug("external process memory read failed", exc_info=True)
         return total
 
+    def _log_arming(self, entry: Any, settings: Any, adapter: Any) -> None:
+        """Say once per load where this model's prompts go, and why (#79)."""
+        armed = prefill_health.arming(settings)
+        model = getattr(entry, "model_id", None) or entry.model_path
+        # Name the file and when it was last written: a restore is the usual
+        # way an arming disappears, and its date is the clue (#79).
+        path = getattr(getattr(self, "_settings_manager", None), "settings_file", None)
+        modified = ""
+        try:
+            if path is not None and path.exists():
+                stamp = time.strftime(
+                    "%Y-%m-%dT%H:%M:%S", time.localtime(path.stat().st_mtime)
+                )
+                modified = f", modified {stamp}"
+        except OSError:
+            pass
+        source = f"model_settings.json{modified}"
+        layers = "auto" if armed["automatic_layers"] else armed["layers"]
+        if armed["reason"] == prefill_health.HALF_CONFIGURED:
+            logger.error(
+                "Prefill helper arming for %s: prefill_helper_layers=%s is set "
+                "but prefill_helper_node_id is not (%s); every prompt runs on "
+                "this Mac. Set the helper Mac or clear the layers.",
+                model,
+                armed["layers"],
+                source,
+            )
+        elif armed["path"] == prefill_health.HELPER and adapter is None:
+            logger.warning(
+                "Prefill helper arming for %s: node=%s layers=%s (%s), but this "
+                "model has no Prefill Accelerator; every prompt runs on this Mac.",
+                model,
+                armed["node_id"],
+                layers,
+                source,
+            )
+        elif armed["path"] == prefill_health.HELPER:
+            logger.info(
+                "Prefill helper armed for %s: node=%s layers=%s (%s)",
+                model,
+                armed["node_id"],
+                layers,
+                source,
+            )
+        else:
+            logger.info(
+                "Prefill helper not armed for %s: neither "
+                "prefill_helper_node_id nor prefill_helper_layers is set (%s); "
+                "every prompt runs on this Mac.",
+                model,
+                source,
+            )
+
     def _start_prefill_helper_early(self, entry: Any, settings: Any) -> bool:
-        """Start the chosen Prefill Accelerator while this Mac loads the model."""
+        """Start the chosen Prefill Accelerator while this Mac loads the model.
+
+        Also says, once per load, where this model's prompts will run (#79).
+        A lost arming used to be invisible: the only symptom was slower
+        prompts and nothing alerted on slower.
+        """
         node_id = getattr(settings, "prefill_helper_node_id", None)
         model_type = (entry.config_model_type or "").replace("-", "_").lower()
         adapter = prefill_stage_adapter(
             entry.config_model_type, entry.engine_type, entry.model_path
         )
+        self._log_arming(entry, settings, adapter)
         if node_id is None or adapter is None:
             return False
         prepare_prefill_helper(

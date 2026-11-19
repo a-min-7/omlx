@@ -3146,6 +3146,17 @@ async def update_model_settings(
         supported = stage_adapter_for(
             entry.config_model_type, entry.engine_type, entry.model_path
         )
+        if request.prefill_helper_node_id and not supported:
+            # The write that can silently disarm a model: a settings update
+            # that carries the current value while the adapter check comes
+            # back empty (an engine type without an adapter, a model whose
+            # type is not resolved yet) stores None (#79).
+            logger.warning(
+                "Prefill helper arming for %s cleared: this model has no "
+                "Prefill Accelerator adapter, so helper %s was not saved.",
+                model_id,
+                request.prefill_helper_node_id,
+            )
         current_settings.prefill_helper_node_id = (
             (request.prefill_helper_node_id or None) if supported else None
         )

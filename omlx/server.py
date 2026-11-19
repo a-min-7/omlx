@@ -245,6 +245,7 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .prefill_helper import peers as prefill_peers
 from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
 from .prefill_progress import get_prefill_tracker
@@ -635,6 +636,10 @@ async def lifespan(app: FastAPI):
                 bind_host, str
             ) and is_loopback_bind(bind_host)
             configure_discovery_service(discovery_service)
+            # One of the observers that feed the prefill helper's peer
+            # state (#86 d): a Mac that answers discovery again is exactly
+            # the case where the manager sat in backoff, not unanswered.
+            discovery_service.on_change(prefill_peers.announce_peer)
             await asyncio.to_thread(discovery_service.start)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Cluster discovery service failed to start: %s", exc)

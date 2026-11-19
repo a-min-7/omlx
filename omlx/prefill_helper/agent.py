@@ -36,6 +36,10 @@ from ..cluster.transport import probe_host_interfaces
 from . import wire
 from .adapter import StageAdapter
 from .adapters import adapter_for
+from .handshake import (  # noqa: F401 - the routes call them on this module
+    plan_mismatch,
+    source_mismatch,
+)
 from .launcher import LaunchError, UnreachableError, required_files
 
 __all__ = ["LaunchError", "required_files"]
@@ -328,6 +332,10 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         "version": info.get("version"),
         "data_protocol": info.get("data_protocol"),
         "contracts": info.get("contracts") or {},
+        # A helper built from other source still speaks the same protocol;
+        # these two say whether that source reads the memory plan the same way.
+        "commit": info.get("commit"),
+        "plan_api_version": info.get("plan_api_version"),
         "budgets": budgets,
         "budget": sum(budgets),
         "memory": sum(int(gpu["total"]) for gpu in gpus),
