@@ -1577,6 +1577,51 @@ def test_agent_transport_drives_a_helper_daemon(tmp_path, monkeypatch):
     listener.close()
 
 
+def test_remote_info_derives_the_budget_when_the_daemon_cannot_enumerate(monkeypatch):
+    """An empty GPU list is a failed measurement; it is not "nothing fits"."""
+
+    class _Open:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *exc):
+            return False
+
+    payload = {
+        "version": "0.1.7",
+        "data_protocol": wire.PROTOCOL,
+        "contracts": {"qwen3_5_moe": 1},
+        "disk_free": 1 << 40,
+        "links": [],
+        "session": {},
+        "ram": 130 << 30,
+    }
+    monkeypatch.setattr(agent, "_session", lambda target: _Open())
+    monkeypatch.setattr(agent, "_call", lambda sock, meta: payload)
+
+    payload["gpus"] = [
+        {"name": "NVIDIA GB10", "total": 130 << 30, "free": 40 << 30, "integrated": True}
+    ]
+    info = agent.remote_info(SimpleNamespace(name="nvidia1"))
+    assert (info["budget"], info["memory"]) == (40 << 30, 130 << 30)
+    assert (info["integrated"], info["gpu_enumeration"]) == (True, "ok")
+
+    # The daemon could not enumerate its GPU (NVML failure in the container):
+    # system memory, which the same payload reports, says what it can hold.
+    payload["gpus"] = []
+    payload["ram_available"] = 57 << 30
+    info = agent.remote_info(SimpleNamespace(name="nvidia1"))
+    assert info["budget"] == (57 << 30) - manager_module._OS_BYTES
+    assert (info["memory"], info["integrated"]) == (130 << 30, True)
+    assert info["gpu_enumeration"] == "failed"
+
+    # Never invent a budget: at or under the reserve, or with no figure, it stays 0.
+    payload["ram_available"] = 10 << 30
+    assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 0
+    del payload["ram_available"]
+    assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 0
+
+
 def test_a_helper_daemon_moves_to_a_faster_wired_link(monkeypatch):
     lan = agent.AgentTarget(
         "gpu", "gpu-box", "192.168.1.230", "ethernet", 8851, _KEY, speed_mbps=1000

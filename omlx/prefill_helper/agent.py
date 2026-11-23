@@ -315,14 +315,26 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
     session = info.get("session") or {}
     held = list(session.get("gpu_bytes") or [])
     gpus = info.get("gpus") or []
-    # A session running there makes way for this one, so its memory counts.
-    # Its size is the plan's estimate, so a GPU never gets more than it has.
+    # #108: an empty list means the daemon could not enumerate its GPU (NVML failure inside the
+    # container: nvidia-smi reports "Failed to initialize NVML" and gpus.gpus() returns []).
+    # Reporting budget 0 then makes every session non-re-armable and surfaces as "not even one
+    # layer fits" — a memory claim produced by a measurement failure. An integrated helper's
+    # budget is a function of system memory, which the same payload still reports, so derive it.
+    # Never invent: if that figure is missing or at/below the reserve, the budget stays 0.
+    enumerated = bool(gpus)
     budgets = [
         min(
             int(gpu["total"]), int(gpu["free"]) + (int(held[i]) if i < len(held) else 0)
         )
         for i, gpu in enumerate(gpus)
     ]
+    if not enumerated:
+        # The reserve lives in manager; import it here so the constant stays single-sourced
+        # (a module-level import would be circular: manager imports this module).
+        from .manager import _OS_BYTES
+        ram = int(info.get("ram_available") or 0)
+        if ram > _OS_BYTES:
+            budgets = [ram - _OS_BYTES]
     names = [str(gpu.get("name") or "GPU") for gpu in gpus]
     device = names[0] if len(set(names)) == 1 and names else " + ".join(names)
     if len(names) > 1 and len(set(names)) == 1:
@@ -335,8 +347,10 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         "oqh": info.get("oqh") or {},
         "budgets": budgets,
         "budget": sum(budgets),
-        "memory": sum(int(gpu["total"]) for gpu in gpus),
-        "integrated": any(gpu.get("integrated") for gpu in gpus),
+        "memory": (sum(int(gpu["total"]) for gpu in gpus)
+                   if enumerated else int(info.get("ram") or 0)),
+        "integrated": any(gpu.get("integrated") for gpu in gpus) or not enumerated,
+        "gpu_enumeration": "ok" if enumerated else "failed",
         "device": device,
         "disk_free": info.get("disk_free"),
         "link_mbps": int(speed) if speed else None,

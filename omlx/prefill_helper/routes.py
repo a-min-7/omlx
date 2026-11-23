@@ -215,6 +215,12 @@ def _check(node_id: str) -> dict:
     rows.append(version)
     budgets = helper_budget(info)
     memory = {"key": "memory", "status": "pass", "bytes": sum(budgets)}
+    if info.get("gpu_enumeration") == "failed":
+        # #108/#110: the budget here is derived from system RAM because the helper could not
+        # enumerate its GPU. Say so instead of reporting a healthy-looking number.
+        memory.update(status="warn",
+                      detail="the helper could not enumerate its GPUs; this budget is derived "
+                             "from system RAM, not from a GPU query")
     if "budgets" in info:
         memory["gpus"] = len(budgets)
     rows.append(memory)
