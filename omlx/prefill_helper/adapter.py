@@ -74,6 +74,10 @@ class StageAdapter:
     """Split a model family's prefill forward between two Macs."""
 
     model_types: tuple[str, ...] = ()
+    # The family this instance was selected for. One adapter can serve more
+    # than one (`qwen3_5` and `qwen3_5_moe`), so a check of a helper's contracts
+    # must know which of them the model itself belongs to.
+    model_type: str | None = None
     # Version of what crosses the link for this family: names, dtypes, shapes
     # and meaning of the boundary, state, prefix and host-fed arrays. A helper
     # built from other code connects only when its version is equal. Raise it

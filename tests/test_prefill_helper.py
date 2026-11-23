@@ -1577,6 +1577,96 @@ def test_agent_transport_drives_a_helper_daemon(tmp_path, monkeypatch):
     listener.close()
 
 
+def test_remote_info_derives_the_budget_when_the_daemon_cannot_enumerate(monkeypatch):
+    """An empty GPU list is a failed measurement; it is not "nothing fits"."""
+
+    class _Open:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *exc):
+            return False
+
+    payload = {
+        "version": "0.1.7",
+        "data_protocol": wire.PROTOCOL,
+        "contracts": {"qwen3_5_moe": 1},
+        "disk_free": 1 << 40,
+        "links": [],
+        "session": {},
+        "ram": 130 << 30,
+    }
+    monkeypatch.setattr(agent, "_session", lambda target: _Open())
+    monkeypatch.setattr(agent, "_call", lambda sock, meta: payload)
+
+    payload["gpus"] = [
+        {
+            "name": "NVIDIA GB10",
+            "total": 130 << 30,
+            "free": 40 << 30,
+            "integrated": True,
+        }
+    ]
+    info = agent.remote_info(SimpleNamespace(name="nvidia1"))
+    assert (info["budget"], info["memory"]) == (40 << 30, 130 << 30)
+    assert (info["integrated"], info["gpu_enumeration"]) == (True, "ok")
+
+    # The daemon could not enumerate its GPU (NVML failure in the container):
+    # system memory, which the same payload reports, says what it can hold.
+    payload["gpus"] = []
+    payload["ram_available"] = 57 << 30
+    info = agent.remote_info(SimpleNamespace(name="nvidia1"))
+    assert info["budget"] == (57 << 30) - manager_module._OS_BYTES
+    assert (info["memory"], info["integrated"]) == (130 << 30, True)
+    assert info["gpu_enumeration"] == "failed"
+
+    # Never invent a budget: at or under the reserve, or with no figure, it stays 0.
+    payload["ram_available"] = 10 << 30
+    assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 0
+    del payload["ram_available"]
+    assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 0
+
+    # A session already on the helper makes way for this one, exactly as the
+    # enumerated path adds `held` per GPU: MemAvailable is net of its memory,
+    # so its footprint comes back — summed, because one derived budget stands
+    # for the whole helper.
+    payload["session"] = {"gpu_bytes": [12 << 30, 24 << 30]}
+    payload["ram_available"] = 20 << 30
+    assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 40 << 30
+    # The incident reading: 57 GiB available with the 27B holding 36 GiB.
+    payload["ram_available"] = 57 << 30
+    assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 77 << 30
+
+
+def test_a_helper_must_speak_the_models_own_family():
+    """A helper built for qwen3_5 cannot stand in for a qwen3_5_moe model."""
+    moe, dense = adapter_for("qwen3_5_moe"), adapter_for("qwen3_5")
+    assert (moe.model_type, dense.model_type) == ("qwen3_5_moe", "qwen3_5")
+
+    only_dense = {"data_protocol": wire.PROTOCOL, "contracts": {"qwen3_5": 1}}
+    assert agent.incompatible(only_dense, dense, "nvidia1") is None
+    assert "does not support" in agent.incompatible(only_dense, moe, "nvidia1")
+
+    only_moe = {"data_protocol": wire.PROTOCOL, "contracts": {"qwen3_5_moe": 1}}
+    assert agent.incompatible(only_moe, moe, "nvidia1") is None
+    older = {
+        "data_protocol": wire.PROTOCOL,
+        "contracts": {"qwen3_5_moe": moe.contract - 1},
+    }
+    assert "update the helper" in agent.incompatible(older, moe, "nvidia1")
+
+    # The oQh map is per family too: a helper that reads only the dense
+    # family's format does not make a MoE checkpoint readable.
+    reads_sibling = {
+        "data_protocol": wire.PROTOCOL,
+        "contracts": {"qwen3_5_moe": 1},
+        "oqh": {"qwen3_5": 1},
+    }
+    assert "oQh" in agent.incompatible(reads_sibling, moe, "nvidia1", oqh=1)
+    reads_sibling["oqh"] = {"qwen3_5_moe": 1}
+    assert agent.incompatible(reads_sibling, moe, "nvidia1", oqh=1) is None
+
+
 def test_a_helper_daemon_moves_to_a_faster_wired_link(monkeypatch):
     lan = agent.AgentTarget(
         "gpu", "gpu-box", "192.168.1.230", "ethernet", 8851, _KEY, speed_mbps=1000
@@ -1679,6 +1769,17 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
     info["version"] = agent.MIN_HELPER_VERSION
     version = helper_routes._check("n")["rows"][2]
     assert (version["status"], version["fix"]) == ("pass", "")
+
+    # #108/#110: a budget derived from RAM warns, but no budget at all fails.
+    # A literal pass on the second would say a helper that cannot arm anything
+    # is healthy, which is the false green this row exists to catch.
+    info["gpu_enumeration"] = "failed"
+    info["budgets"] = [41 * gib]
+    memory = helper_routes._check("n")["rows"][3]
+    assert memory["status"] == "warn" and "derived" in memory["detail"]
+    info["budgets"] = []
+    memory = helper_routes._check("n")["rows"][3]
+    assert (memory["status"], memory["gpus"], memory["bytes"]) == ("fail", 0, 0)
 
 
 # ---------------------------------------------------------------------------
