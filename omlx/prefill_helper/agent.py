@@ -332,6 +332,7 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         # The reserve lives in manager; import it here so the constant stays single-sourced
         # (a module-level import would be circular: manager imports this module).
         from .manager import _OS_BYTES
+
         ram = int(info.get("ram_available") or 0)
         if ram > _OS_BYTES:
             budgets = [ram - _OS_BYTES]
@@ -347,8 +348,11 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         "oqh": info.get("oqh") or {},
         "budgets": budgets,
         "budget": sum(budgets),
-        "memory": (sum(int(gpu["total"]) for gpu in gpus)
-                   if enumerated else int(info.get("ram") or 0)),
+        "memory": (
+            sum(int(gpu["total"]) for gpu in gpus)
+            if enumerated
+            else int(info.get("ram") or 0)
+        ),
         "integrated": any(gpu.get("integrated") for gpu in gpus) or not enumerated,
         "gpu_enumeration": "ok" if enumerated else "failed",
         "device": device,
@@ -378,7 +382,17 @@ def incompatible(
     contracts = info.get("contracts") or {}
     if adapter is None:
         return None if contracts else f"{name} supports no model family."
-    theirs = next((contracts[t] for t in adapter.model_types if t in contracts), None)
+    # One adapter can serve several families (qwen3_5 and qwen3_5_moe), but a
+    # helper's contracts name only the families it was built with. Check the
+    # family this model belongs to: an adapter that speaks the sibling cannot
+    # stand in for it. Adapters built outside `adapter_for` carry no family and
+    # keep the old best-effort match.
+    if adapter.model_type is not None:
+        theirs = contracts.get(adapter.model_type)
+    else:
+        theirs = next(
+            (contracts[t] for t in adapter.model_types if t in contracts), None
+        )
     if theirs is None:
         return f"{name} does not support this model family yet."
     if theirs != adapter.contract:

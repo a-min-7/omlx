@@ -9,17 +9,33 @@ from .minimax_m3 import MiniMaxM3Adapter
 from .qwen3_5 import Qwen35Adapter
 from .qwen4_exp import Qwen4ExpAdapter
 
+
+def _instances(adapter_type: type[StageAdapter]) -> dict[str, StageAdapter]:
+    """One instance per family, each knowing the family it was chosen for.
+
+    A helper advertises the families it was built with, so ``qwen3_5`` and
+    ``qwen3_5_moe`` cannot share one instance: the same object would answer
+    for both and a helper that speaks only one would pass for the other.
+    """
+    instances = {}
+    for model_type in adapter_type.model_types:
+        adapter = adapter_type()
+        adapter.model_type = model_type
+        instances[model_type] = adapter
+    return instances
+
+
 _ADAPTERS: dict[str, StageAdapter] = {
     model_type: adapter
-    for adapter in (
-        DeepseekV41Adapter(),
-        Glm5NextAdapter(),
-        Inkling2Adapter(),
-        MiniMaxM3Adapter(),
-        Qwen35Adapter(),
-        Qwen4ExpAdapter(),
+    for adapter_type in (
+        DeepseekV41Adapter,
+        Glm5NextAdapter,
+        Inkling2Adapter,
+        MiniMaxM3Adapter,
+        Qwen35Adapter,
+        Qwen4ExpAdapter,
     )
-    for model_type in adapter.model_types
+    for model_type, adapter in _instances(adapter_type).items()
 }
 
 

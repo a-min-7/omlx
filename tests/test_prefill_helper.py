@@ -1600,7 +1600,12 @@ def test_remote_info_derives_the_budget_when_the_daemon_cannot_enumerate(monkeyp
     monkeypatch.setattr(agent, "_call", lambda sock, meta: payload)
 
     payload["gpus"] = [
-        {"name": "NVIDIA GB10", "total": 130 << 30, "free": 40 << 30, "integrated": True}
+        {
+            "name": "NVIDIA GB10",
+            "total": 130 << 30,
+            "free": 40 << 30,
+            "integrated": True,
+        }
     ]
     info = agent.remote_info(SimpleNamespace(name="nvidia1"))
     assert (info["budget"], info["memory"]) == (40 << 30, 130 << 30)
@@ -1620,6 +1625,24 @@ def test_remote_info_derives_the_budget_when_the_daemon_cannot_enumerate(monkeyp
     assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 0
     del payload["ram_available"]
     assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 0
+
+
+def test_a_helper_must_speak_the_models_own_family():
+    """A helper built for qwen3_5 cannot stand in for a qwen3_5_moe model."""
+    moe, dense = adapter_for("qwen3_5_moe"), adapter_for("qwen3_5")
+    assert (moe.model_type, dense.model_type) == ("qwen3_5_moe", "qwen3_5")
+
+    only_dense = {"data_protocol": wire.PROTOCOL, "contracts": {"qwen3_5": 1}}
+    assert agent.incompatible(only_dense, dense, "nvidia1") is None
+    assert "does not support" in agent.incompatible(only_dense, moe, "nvidia1")
+
+    only_moe = {"data_protocol": wire.PROTOCOL, "contracts": {"qwen3_5_moe": 1}}
+    assert agent.incompatible(only_moe, moe, "nvidia1") is None
+    older = {
+        "data_protocol": wire.PROTOCOL,
+        "contracts": {"qwen3_5_moe": moe.contract - 1},
+    }
+    assert "update the helper" in agent.incompatible(older, moe, "nvidia1")
 
 
 def test_a_helper_daemon_moves_to_a_faster_wired_link(monkeypatch):
