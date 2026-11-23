@@ -1655,6 +1655,17 @@ def test_a_helper_must_speak_the_models_own_family():
     }
     assert "update the helper" in agent.incompatible(older, moe, "nvidia1")
 
+    # The oQh map is per family too: a helper that reads only the dense
+    # family's format does not make a MoE checkpoint readable.
+    reads_sibling = {
+        "data_protocol": wire.PROTOCOL,
+        "contracts": {"qwen3_5_moe": 1},
+        "oqh": {"qwen3_5": 1},
+    }
+    assert "oQh" in agent.incompatible(reads_sibling, moe, "nvidia1", oqh=1)
+    reads_sibling["oqh"] = {"qwen3_5_moe": 1}
+    assert agent.incompatible(reads_sibling, moe, "nvidia1", oqh=1) is None
+
 
 def test_a_helper_daemon_moves_to_a_faster_wired_link(monkeypatch):
     lan = agent.AgentTarget(

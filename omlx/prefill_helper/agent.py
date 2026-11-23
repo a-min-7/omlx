@@ -406,7 +406,14 @@ def incompatible(
         return f"{name} and this Mac disagree on this model family; update {older}."
     if oqh is not None:
         reads = info.get("oqh") or {}
-        if not any(reads.get(t) == oqh for t in adapter.model_types):
+        # As above: an adapter selected for one family cannot let a helper
+        # that only reads its sibling's format stand in for this checkpoint.
+        families = (
+            (adapter.model_type,)
+            if adapter.model_type is not None
+            else adapter.model_types
+        )
+        if not any(reads.get(t) == oqh for t in families):
             return f"{name} does not read oQh weights of this model family yet."
     return None
 
