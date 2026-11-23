@@ -1626,6 +1626,17 @@ def test_remote_info_derives_the_budget_when_the_daemon_cannot_enumerate(monkeyp
     del payload["ram_available"]
     assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 0
 
+    # A session already on the helper makes way for this one, exactly as the
+    # enumerated path adds `held` per GPU: MemAvailable is net of its memory,
+    # so its footprint comes back — summed, because one derived budget stands
+    # for the whole helper.
+    payload["session"] = {"gpu_bytes": [12 << 30, 24 << 30]}
+    payload["ram_available"] = 20 << 30
+    assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 40 << 30
+    # The incident reading: 57 GiB available with the 27B holding 36 GiB.
+    payload["ram_available"] = 57 << 30
+    assert agent.remote_info(SimpleNamespace(name="nvidia1"))["budget"] == 77 << 30
+
 
 def test_a_helper_must_speak_the_models_own_family():
     """A helper built for qwen3_5 cannot stand in for a qwen3_5_moe model."""

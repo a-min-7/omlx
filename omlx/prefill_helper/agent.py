@@ -334,8 +334,14 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         from .manager import _OS_BYTES
 
         ram = int(info.get("ram_available") or 0)
-        if ram > _OS_BYTES:
-            budgets = [ram - _OS_BYTES]
+        # The enumerated path above adds back the memory of a session already
+        # running there, because that session makes way for this one. With no
+        # GPU list there is one derived budget for the whole helper, so the
+        # session's summed footprint comes back to it.
+        reclaimable = sum(int(b) for b in held)
+        free = max(0, ram - _OS_BYTES)
+        if ram and (free or reclaimable):
+            budgets = [free + reclaimable]
     names = [str(gpu.get("name") or "GPU") for gpu in gpus]
     device = names[0] if len(set(names)) == 1 and names else " + ".join(names)
     if len(names) > 1 and len(set(names)) == 1:
