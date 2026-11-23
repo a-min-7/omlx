@@ -215,12 +215,22 @@ def _check(node_id: str) -> dict:
     rows.append(version)
     budgets = helper_budget(info)
     memory = {"key": "memory", "status": "pass", "bytes": sum(budgets)}
-    if info.get("gpu_enumeration") == "failed":
-        # #108/#110: the budget here is derived from system RAM because the helper could not
-        # enumerate its GPU. Say so instead of reporting a healthy-looking number.
-        memory.update(status="warn",
-                      detail="the helper could not enumerate its GPUs; this budget is derived "
-                             "from system RAM, not from a GPU query")
+    if "budgets" in info and not any(budgets):
+        # No GPU reported any room. That is not a healthy helper with a small
+        # budget: nothing can be re-armed on it, and the check must say so.
+        memory.update(
+            status="fail",
+            detail="the helper reports no GPU memory at all; "
+            "no session can be re-armed",
+        )
+    elif info.get("gpu_enumeration") == "failed":
+        # #108/#110: the helper could not enumerate its GPU, so this budget is
+        # derived from system RAM. Say so instead of reporting a healthy number.
+        memory.update(
+            status="warn",
+            detail="the helper could not enumerate its GPUs; this budget is "
+            "derived from system RAM, not from a GPU query",
+        )
     if "budgets" in info:
         memory["gpus"] = len(budgets)
     rows.append(memory)

@@ -1748,6 +1748,17 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
     version = helper_routes._check("n")["rows"][2]
     assert (version["status"], version["fix"]) == ("pass", "")
 
+    # #108/#110: a budget derived from RAM warns, but no budget at all fails.
+    # A literal pass on the second would say a helper that cannot arm anything
+    # is healthy, which is the false green this row exists to catch.
+    info["gpu_enumeration"] = "failed"
+    info["budgets"] = [41 * gib]
+    memory = helper_routes._check("n")["rows"][3]
+    assert memory["status"] == "warn" and "derived" in memory["detail"]
+    info["budgets"] = []
+    memory = helper_routes._check("n")["rows"][3]
+    assert (memory["status"], memory["gpus"], memory["bytes"]) == ("fail", 0, 0)
+
 
 # ---------------------------------------------------------------------------
 # GLM-5.3: KDA and sparse-attention layers on either side of the cut.
